@@ -2,6 +2,7 @@
 
 #include <AIS_InteractiveContext.hxx>
 #include <AIS_InteractiveObject.hxx>
+#include <AIS_SelectionScheme.hxx>
 #include <AIS_Shape.hxx>
 #include <AIS_Triangulation.hxx>
 #include <Aspect_DisplayConnection.hxx>
@@ -12,6 +13,7 @@
 #include <Poly_Triangulation.hxx>
 #include <Quantity_Color.hxx>
 #include <Standard_Failure.hxx>
+#include <StdSelect_BRepOwner.hxx>
 #include <V3d_TypeOfVisualization.hxx>
 #include <V3d_View.hxx>
 #include <V3d_Viewer.hxx>
@@ -136,6 +138,7 @@ struct OcctViewport::Impl {
         viewer->SetDefaultLights();
         viewer->SetLightOn();
         context = new AIS_InteractiveContext(viewer);
+        context->SetPixelTolerance(4);
         view = viewer->CreateView();
         Handle(WNT_Window) window =
             new WNT_Window(reinterpret_cast<Aspect_Handle>(owner->winId()));
@@ -176,9 +179,10 @@ struct OcctViewport::Impl {
             context->SetTransparency(cadPresentation, 0.72, Standard_False);
             context->Display(cadPresentation, Standard_False);
             if (faceSelectionEnabled) {
-                context->Activate(cadPresentation,
-                                  AIS_Shape::SelectionMode(TopAbs_FACE),
-                                  Standard_True);
+                context->SetSelectionModeActive(
+                    cadPresentation, AIS_Shape::SelectionMode(TopAbs_FACE),
+                    Standard_True, AIS_SelectionModesConcurrency_Single,
+                    Standard_True);
             } else {
                 context->Deactivate(cadPresentation);
             }
@@ -306,14 +310,24 @@ void OcctViewport::mousePressEvent(QMouseEvent* event) {
         !impl_->cadShape.IsNull()) {
         const QPoint p = impl_->native(event->pos());
         impl_->context->MoveTo(p.x(), p.y(), impl_->view, Standard_True);
-        impl_->context->Select(Standard_True);
-        if (impl_->context->HasSelectedShape()) {
-            const TopoDS_Shape selected = impl_->context->SelectedShape();
-            if (!selected.IsNull() && selected.ShapeType() == TopAbs_FACE &&
-                impl_->faceSelectionCallback) {
-                impl_->faceSelectionCallback(TopoDS::Face(selected));
+        TopoDS_Shape selected;
+        if (impl_->context->HasDetected()) {
+            const Handle(StdSelect_BRepOwner) owner =
+                Handle(StdSelect_BRepOwner)::DownCast(
+                    impl_->context->DetectedOwner());
+            if (!owner.IsNull()) {
+                selected = owner->Shape();
             }
+            impl_->context->SelectDetected(AIS_SelectionScheme_Replace);
         }
+        if (selected.IsNull() && impl_->context->HasSelectedShape()) {
+            selected = impl_->context->SelectedShape();
+        }
+        if (!selected.IsNull() && selected.ShapeType() == TopAbs_FACE &&
+            impl_->faceSelectionCallback) {
+            impl_->faceSelectionCallback(TopoDS::Face(selected));
+        }
+        impl_->view->Redraw();
         event->accept();
         return;
     }
