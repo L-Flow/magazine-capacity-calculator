@@ -250,7 +250,10 @@ void OcctViewport::clearPacking() {
 
 void OcctViewport::setFaceSelectionEnabled(bool enabled) {
     impl_->faceSelectionEnabled = enabled;
-    if (impl_->initialized && impl_->hasData) impl_->rebuild();
+    // Face selection is also used while no packing result is displayed.  The
+    // previous hasData guard left the CAD presentation in its old selection
+    // mode after opening a model and made left-clicking faces a no-op.
+    if (impl_->initialized) impl_->rebuild();
 }
 
 void OcctViewport::setFaceSelectionCallback(FaceSelectionCallback callback) {
