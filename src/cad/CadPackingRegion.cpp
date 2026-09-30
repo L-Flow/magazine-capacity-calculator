@@ -2,7 +2,9 @@
 
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepExtrema_ExtPF.hxx>
 #include <BRepGProp.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRep_Tool.hxx>
@@ -46,8 +48,22 @@ struct FallbackCell {
     Bnd_Box bounds;
 };
 
+struct BoundaryFace {
+    TopoDS_Face face;
+    Bnd_Box bounds;
+    GeomAbs_SurfaceType type{GeomAbs_OtherSurface};
+    gp_Pnt planePoint;
+    gp_Dir planeNormal;
+    gp_Pnt cylinderLocation;
+    gp_Dir cylinderAxis;
+    double cylinderRadius{0.0};
+    double cylinderAxisMin{0.0};
+    double cylinderAxisMax{0.0};
+};
+
 struct BoundaryConstraints {
     std::shared_ptr<BRepClass3d_SolidClassifier> classifier;
+    std::vector<BoundaryFace> faces;
     std::vector<PlaneConstraint> planes;
     std::vector<CylinderConstraint> cylinders;
     std::vector<FallbackCell> fallbackCells;
@@ -190,15 +206,81 @@ bool preciseSphereInside(const CadImportResult& model,
     const gp_Pnt sourceCenter(center.x + model.minX,
                               center.y + model.minY,
                               center.z + model.minZ);
+    // Reject candidates that are visibly too close to analytic faces before
+    // invoking the comparatively expensive solid classifier.
+    Bnd_Box sphereBounds;
+    sphereBounds.Update(sourceCenter.X() - radius - tolerance,
+                        sourceCenter.Y() - radius - tolerance,
+                        sourceCenter.Z() - radius - tolerance,
+                        sourceCenter.X() + radius + tolerance,
+                        sourceCenter.Y() + radius + tolerance,
+                        sourceCenter.Z() + radius + tolerance);
+    for (const BoundaryFace& boundary : constraints.faces) {
+        if (boundary.type != GeomAbs_Plane &&
+            boundary.type != GeomAbs_Cylinder) {
+            continue;
+        }
+        Bnd_Box nearby = boundary.bounds;
+        nearby.Enlarge(radius + tolerance);
+        if (nearby.IsOut(sphereBounds)) continue;
+
+        if (boundary.type == GeomAbs_Plane) {
+            const double planeDistance = std::abs(
+                gp_Vec(sourceCenter, boundary.planePoint)
+                    .Dot(gp_Vec(boundary.planeNormal)));
+            if (planeDistance < std::max(0.0, radius - tolerance)) {
+                return false;
+            }
+            continue;
+        }
+        if (boundary.type == GeomAbs_Cylinder) {
+            const gp_Vec axialDelta(boundary.cylinderLocation, sourceCenter);
+            const double axial =
+                axialDelta.Dot(gp_Vec(boundary.cylinderAxis));
+            if (axial + radius < boundary.cylinderAxisMin ||
+                axial - radius > boundary.cylinderAxisMax) {
+                continue;
+            }
+            const double radial = radialDistance(
+                sourceCenter, boundary.cylinderLocation,
+                boundary.cylinderAxis);
+            if (std::abs(radial - boundary.cylinderRadius) <
+                std::max(0.0, radius - tolerance)) {
+                return false;
+            }
+            continue;
+        }
+
+    }
     if (!constraints.classifier) return false;
     constraints.classifier->Perform(
         sourceCenter, std::max(1.0e-7, tolerance));
     if (constraints.classifier->State() != TopAbs_IN) return false;
 
-    // The analytic constraints already protect ordinary wall clearances. The
-    // fallback is only for concave pockets, where the center classification is
-    // the important missing test; avoid repeating expensive point-face
-    // extrema for every lattice candidate in that pocket.
+    // A center can be inside a solid while the sphere still crosses a
+    // non-analytic wall. Use OCCT extrema only for those uncommon faces.
+    const TopoDS_Vertex centerVertex =
+        BRepBuilderAPI_MakeVertex(sourceCenter).Vertex();
+    const double clearanceSquared =
+        std::pow(std::max(0.0, radius - tolerance), 2.0);
+    for (const BoundaryFace& boundary : constraints.faces) {
+        if (boundary.type == GeomAbs_Plane ||
+            boundary.type == GeomAbs_Cylinder) {
+            continue;
+        }
+        Bnd_Box nearby = boundary.bounds;
+        nearby.Enlarge(radius + tolerance);
+        if (nearby.IsOut(sphereBounds)) continue;
+        BRepExtrema_ExtPF extrema(centerVertex, boundary.face,
+                                  Extrema_ExtFlag_MIN, Extrema_ExtAlgo_Grad);
+        if (!extrema.IsDone()) return false;
+        double minimumDistanceSquared = std::numeric_limits<double>::infinity();
+        for (int index = 1; index <= extrema.NbExt(); ++index) {
+            minimumDistanceSquared =
+                std::min(minimumDistanceSquared, extrema.SquareDistance(index));
+        }
+        if (minimumDistanceSquared < clearanceSquared) return false;
+    }
     return true;
 }
 
@@ -206,23 +288,26 @@ bool sphereInside(const CadImportResult& model,
                   const BoundaryConstraints& constraints,
                   const magazine::packing::Vec3& center, double radius,
                   double tolerance) {
-    // The analytic half-space test is a conservative fast path for the
-    // ordinary part of the model. Concave pockets use the cached classifier.
-    if (constraints.analytic &&
-        analyticSphereInside(model, constraints, center, radius, tolerance)) {
+    const bool analyticInside =
+        constraints.analytic &&
+        analyticSphereInside(model, constraints, center, radius, tolerance);
+    if (analyticInside) {
         return true;
     }
+
     const gp_Pnt sourceCenter(center.x + model.minX,
                               center.y + model.minY,
                               center.z + model.minZ);
     for (const FallbackCell& cell : constraints.fallbackCells) {
-        if (!cell.bounds.IsOut(sourceCenter) &&
+        Bnd_Box candidateCell = cell.bounds;
+        candidateCell.Enlarge(radius + tolerance);
+        if (!candidateCell.IsOut(sourceCenter) &&
             analyticSphereInside(model, constraints, center, 0.0,
                                  tolerance)) {
-            // The cell was confirmed inside the real solid during region
-            // construction. Its enlargement covers the supported sphere
-            // radius range and avoids a classifier call per candidate.
-            return true;
+            // The coarse cell is only a candidate index. The final decision
+            // must use the exact solid and face-clearance checks below.
+            return preciseSphereInside(model, constraints, center, radius,
+                                       tolerance);
         }
     }
     return constraints.analytic
@@ -252,6 +337,8 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
             gp_Dir normal = surface.Plane().Axis().Direction();
             if (face.Orientation() == TopAbs_REVERSED) normal.Reverse();
             constraints.planes.push_back({surface.Plane().Location(), normal});
+            constraints.faces.push_back({face, faceBounds, GeomAbs_Plane,
+                                         surface.Plane().Location(), normal});
         } else if (surface.GetType() == GeomAbs_Cylinder) {
             const gp_Cylinder cylinder = surface.Cylinder();
             const double referenceRadial = radialDistance(
@@ -280,8 +367,13 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                 {cylinder.Location(), cylinder.Axis().Direction(),
                  cylinder.Radius(), referenceRadial < cylinder.Radius(),
                  minAxis, maxAxis});
+            constraints.faces.push_back(
+                {face, faceBounds, GeomAbs_Cylinder, gp_Pnt(), gp_Dir(),
+                 cylinder.Location(), cylinder.Axis().Direction(),
+                 cylinder.Radius(), minAxis, maxAxis});
         } else {
             constraints.analytic = false;
+            constraints.faces.push_back({face, faceBounds, surface.GetType()});
         }
     }
     // Build the classifier once per imported/aligned solid.  Constructing a
@@ -292,8 +384,8 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
 
     // Probe the non-convex remainder once. The analytic half-space test is
     // deliberately conservative for a concave solid, so samples rejected by
-    // it are checked with OCCT and retained as enlarged fallback cells when
-    // they are truly inside. Subsequent packing queries only test these boxes.
+    // it are checked with OCCT and retained as coarse fallback cells when
+    // they are truly inside. Queries enlarge these cells by the active radius.
     if (constraints.analytic) {
         constexpr double sampleStep = 64.0;
         constexpr double maximumRadius = 21.0;
@@ -325,18 +417,17 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                         continue;
                     }
                     Bnd_Box cell;
-                    cell.Update(sourceSample.X() - sampleStep * 0.5 - maximumRadius,
-                                sourceSample.Y() - sampleStep * 0.5 - maximumRadius,
-                                sourceSample.Z() - sampleStep * 0.5 - maximumRadius,
-                                sourceSample.X() + sampleStep * 0.5 + maximumRadius,
-                                sourceSample.Y() + sampleStep * 0.5 + maximumRadius,
-                                sourceSample.Z() + sampleStep * 0.5 + maximumRadius);
+                    cell.Update(sourceSample.X() - sampleStep * 0.5,
+                                sourceSample.Y() - sampleStep * 0.5,
+                                sourceSample.Z() - sampleStep * 0.5,
+                                sourceSample.X() + sampleStep * 0.5,
+                                sourceSample.Y() + sampleStep * 0.5,
+                                sourceSample.Z() + sampleStep * 0.5);
                     constraints.fallbackCells.push_back({cell});
                 }
             }
         }
     }
-
     CadPackingRegion result;
     result.displayDepthMm = bounds.depthMm;
     result.region.bounds = bounds;
