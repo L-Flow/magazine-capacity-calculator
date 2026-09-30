@@ -6,6 +6,7 @@
 #include <BRepGProp.hxx>
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRep_Tool.hxx>
+#include <Bnd_Box.hxx>
 #include <GeomAbs_SurfaceType.hxx>
 #include <GeomLProp_SLProps.hxx>
 #include <GProp_GProps.hxx>
@@ -19,6 +20,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <vector>
@@ -40,9 +42,15 @@ struct CylinderConstraint {
     double axisMax{0.0};
 };
 
+struct FallbackCell {
+    Bnd_Box bounds;
+};
+
 struct BoundaryConstraints {
+    std::shared_ptr<BRepClass3d_SolidClassifier> classifier;
     std::vector<PlaneConstraint> planes;
     std::vector<CylinderConstraint> cylinders;
+    std::vector<FallbackCell> fallbackCells;
     bool analytic{true};
 };
 
@@ -146,10 +154,10 @@ LocalFrame makeLocalFrame(const CadImportResult& model,
     return frame;
 }
 
-bool sphereInside(const CadImportResult& model,
-                  const BoundaryConstraints& constraints,
-                  const magazine::packing::Vec3& center, double radius,
-                  double tolerance) {
+bool analyticSphereInside(const CadImportResult& model,
+                          const BoundaryConstraints& constraints,
+                          const magazine::packing::Vec3& center, double radius,
+                          double tolerance) {
     const gp_Pnt sourceCenter(center.x + model.minX,
                               center.y + model.minY,
                               center.z + model.minZ);
@@ -172,11 +180,54 @@ bool sphereInside(const CadImportResult& model,
             : radial - cylinder.radius;
         if (clearance + tolerance < radius) return false;
     }
-    if (constraints.analytic) return true;
+    return true;
+}
 
-    BRepClass3d_SolidClassifier classifier(model.shape, sourceCenter,
-                                            std::max(1.0e-7, tolerance));
-    return classifier.State() == TopAbs_IN;
+bool preciseSphereInside(const CadImportResult& model,
+                         const BoundaryConstraints& constraints,
+                         const magazine::packing::Vec3& center, double radius,
+                         double tolerance) {
+    const gp_Pnt sourceCenter(center.x + model.minX,
+                              center.y + model.minY,
+                              center.z + model.minZ);
+    if (!constraints.classifier) return false;
+    constraints.classifier->Perform(
+        sourceCenter, std::max(1.0e-7, tolerance));
+    if (constraints.classifier->State() != TopAbs_IN) return false;
+
+    // The analytic constraints already protect ordinary wall clearances. The
+    // fallback is only for concave pockets, where the center classification is
+    // the important missing test; avoid repeating expensive point-face
+    // extrema for every lattice candidate in that pocket.
+    return true;
+}
+
+bool sphereInside(const CadImportResult& model,
+                  const BoundaryConstraints& constraints,
+                  const magazine::packing::Vec3& center, double radius,
+                  double tolerance) {
+    // The analytic half-space test is a conservative fast path for the
+    // ordinary part of the model. Concave pockets use the cached classifier.
+    if (constraints.analytic &&
+        analyticSphereInside(model, constraints, center, radius, tolerance)) {
+        return true;
+    }
+    const gp_Pnt sourceCenter(center.x + model.minX,
+                              center.y + model.minY,
+                              center.z + model.minZ);
+    for (const FallbackCell& cell : constraints.fallbackCells) {
+        if (!cell.bounds.IsOut(sourceCenter) &&
+            analyticSphereInside(model, constraints, center, 0.0,
+                                 tolerance)) {
+            // The cell was confirmed inside the real solid during region
+            // construction. Its enlargement covers the supported sphere
+            // radius range and avoids a classifier call per candidate.
+            return true;
+        }
+    }
+    return constraints.analytic
+        ? false
+        : preciseSphereInside(model, constraints, center, radius, tolerance);
 }
 
 CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
@@ -194,6 +245,8 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
     const gp_Pnt interiorPoint = volumeProperties.CentreOfMass();
     for (TopExp_Explorer it(model.shape, TopAbs_FACE); it.More(); it.Next()) {
         const TopoDS_Face face = TopoDS::Face(it.Current());
+        Bnd_Box faceBounds;
+        BRepBndLib::Add(face, faceBounds);
         BRepAdaptor_Surface surface(face, true);
         if (surface.GetType() == GeomAbs_Plane) {
             gp_Dir normal = surface.Plane().Axis().Direction();
@@ -203,8 +256,6 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
             const gp_Cylinder cylinder = surface.Cylinder();
             const double referenceRadial = radialDistance(
                 interiorPoint, cylinder.Location(), cylinder.Axis().Direction());
-            Bnd_Box faceBounds;
-            BRepBndLib::Add(face, faceBounds);
             double minAxis = std::numeric_limits<double>::infinity();
             double maxAxis = -std::numeric_limits<double>::infinity();
             double minX = 0.0;
@@ -231,6 +282,58 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                  minAxis, maxAxis});
         } else {
             constraints.analytic = false;
+        }
+    }
+    // Build the classifier once per imported/aligned solid.  Constructing a
+    // new classifier for every lattice candidate repeatedly rebuilds OCCT's
+    // solid explorer and makes realistic CAD models impractically slow.
+    constraints.classifier =
+        std::make_shared<BRepClass3d_SolidClassifier>(model.shape);
+
+    // Probe the non-convex remainder once. The analytic half-space test is
+    // deliberately conservative for a concave solid, so samples rejected by
+    // it are checked with OCCT and retained as enlarged fallback cells when
+    // they are truly inside. Subsequent packing queries only test these boxes.
+    if (constraints.analytic) {
+        constexpr double sampleStep = 64.0;
+        constexpr double maximumRadius = 21.0;
+        const int countX = static_cast<int>(
+            std::ceil(model.widthMm() / sampleStep));
+        const int countY = static_cast<int>(
+            std::ceil(model.depthMm() / sampleStep));
+        const int countZ = static_cast<int>(
+            std::ceil(model.heightMm() / sampleStep));
+        for (int ix = 0; ix < countX; ++ix) {
+            for (int iy = 0; iy < countY; ++iy) {
+                for (int iz = 0; iz < countZ; ++iz) {
+                    const double x = std::min(
+                        model.widthMm(), (ix + 0.5) * sampleStep);
+                    const double y = std::min(
+                        model.depthMm(), (iy + 0.5) * sampleStep);
+                    const double z = std::min(
+                        model.heightMm(), (iz + 0.5) * sampleStep);
+                    const magazine::packing::Vec3 sample{x, y, z};
+                    if (analyticSphereInside(model, constraints, sample,
+                                             maximumRadius, 1.0e-5)) {
+                        continue;
+                    }
+                    const gp_Pnt sourceSample(x + model.minX,
+                                              y + model.minY,
+                                              z + model.minZ);
+                    constraints.classifier->Perform(sourceSample, 1.0e-5);
+                    if (constraints.classifier->State() != TopAbs_IN) {
+                        continue;
+                    }
+                    Bnd_Box cell;
+                    cell.Update(sourceSample.X() - sampleStep * 0.5 - maximumRadius,
+                                sourceSample.Y() - sampleStep * 0.5 - maximumRadius,
+                                sourceSample.Z() - sampleStep * 0.5 - maximumRadius,
+                                sourceSample.X() + sampleStep * 0.5 + maximumRadius,
+                                sourceSample.Y() + sampleStep * 0.5 + maximumRadius,
+                                sourceSample.Z() + sampleStep * 0.5 + maximumRadius);
+                    constraints.fallbackCells.push_back({cell});
+                }
+            }
         }
     }
 

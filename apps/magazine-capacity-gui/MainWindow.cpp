@@ -47,7 +47,7 @@ QDoubleSpinBox* directionSpin(double value) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.2"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.3"));
     resize(1180, 760);
 
     auto* central = new QWidget;
@@ -139,7 +139,16 @@ void MainWindow::runLattice() {
         const double radius = caliber_->currentData().toDouble() / 2.0;
         const auto fallback = magazine::packing::boxPackingRegion(inputBox);
         const auto& region = cadRegion_.has_value() ? *cadRegion_ : fallback;
-        const auto result = magazine::packing::packBestFccOrHcp(region, radius);
+        magazine::packing::LatticeOptions latticeOptions;
+        if (cadRegion_.has_value()) {
+            // CAD concave-pocket fallback classification is substantially
+            // more expensive than the box fast path. Two phase offsets keep
+            // the interactive result responsive while still checking both
+            // FCC and HCP arrangements.
+            latticeOptions.phaseDivisions = 2;
+        }
+        const auto result = magazine::packing::packBestFccOrHcp(
+            region, radius, latticeOptions);
         const auto validation = magazine::packing::validatePacking(region, result);
         presentPacking(region, result);
         const QString method = !cadRegion_.has_value()
@@ -301,4 +310,3 @@ void MainWindow::showResult(const QString& label, std::size_t count,
             .arg(static_cast<qulonglong>(count))
             .arg(validation));
 }
-
