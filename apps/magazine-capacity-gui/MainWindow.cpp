@@ -17,6 +17,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <gp_Dir.hxx>
 
@@ -47,7 +48,7 @@ QDoubleSpinBox* directionSpin(double value) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.6"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.7"));
     resize(1180, 760);
 
     auto* central = new QWidget;
@@ -75,6 +76,8 @@ MainWindow::MainWindow(bool autoCompute) {
 
     latticeButton_ = new QPushButton(QStringLiteral("计算 FCC/HCP 理想参考"));
     settlingButton_ = new QPushButton(QStringLiteral("运行无摩擦准静态沉降"));
+    cancelSettlingButton_ = new QPushButton(QStringLiteral("停止准静态计算"));
+    cancelSettlingButton_->setEnabled(false);
     openCadButton_ = new QPushButton(QStringLiteral("打开 STEP / STL"));
     selectEntryFaceButton_ =
         new QPushButton(QStringLiteral("选择弹丸进入面（左键点面）"));
@@ -93,6 +96,7 @@ MainWindow::MainWindow(bool autoCompute) {
     controls->addWidget(cadLabel_);
     controls->addWidget(latticeButton_);
     controls->addWidget(settlingButton_);
+    controls->addWidget(cancelSettlingButton_);
     controls->addWidget(resultLabel_);
     controls->addStretch();
 
@@ -116,6 +120,10 @@ MainWindow::MainWindow(bool autoCompute) {
             [this] { runLattice(); });
     connect(settlingButton_, &QPushButton::clicked, this,
             [this] { runSettling(); });
+    connect(cancelSettlingButton_, &QPushButton::clicked, this,
+            [this] { cancelSettling(); });
+    connect(&settlingWatcher_, &QFutureWatcher<magazine::packing::PackingResult>::finished,
+            this, [this] { finishSettling(); });
     connect(openCadButton_, &QPushButton::clicked, this,
             [this] { openCad(); });
     connect(selectEntryFaceButton_, &QPushButton::clicked, this,
@@ -126,6 +134,11 @@ MainWindow::MainWindow(bool autoCompute) {
     if (autoCompute) {
         QTimer::singleShot(0, this, [this] { runLattice(); });
     }
+}
+
+MainWindow::~MainWindow() {
+    if (settlingCancel_) settlingCancel_->store(true);
+    settlingWatcher_.waitForFinished();
 }
 
 bool MainWindow::saveSnapshot(const QString& path) {
@@ -164,6 +177,7 @@ void MainWindow::runLattice() {
 }
 
 void MainWindow::runSettling() {
+    if (settlingWatcher_.isRunning()) return;
     try {
         const magazine::packing::AxisAlignedBox inputBox{
             width_->value(), depth_->value(), height_->value()};
@@ -171,20 +185,68 @@ void MainWindow::runSettling() {
         const auto fallback = magazine::packing::boxPackingRegion(inputBox);
         const auto& region = cadRegion_.has_value() ? *cadRegion_ : fallback;
         magazine::packing::SettlingOptions options;
-        const auto result =
-            magazine::packing::settleWithoutFriction(region, radius, options);
-        const auto validation =
-            magazine::packing::validatePacking(region, result, 0.15);
-        presentPacking(region, result);
-        const QString method = !cadRegion_.has_value()
-            ? QStringLiteral("无摩擦准静态沉降")
-             : QStringLiteral("无摩擦准静态沉降（CAD 真实内腔，已按用户重力方向对齐）");
-        showResult(method, result.centers.size(),
-                   QString::fromStdString(validation.message));
+        settlingRegion_ = region;
+        settlingCancel_ = std::make_shared<std::atomic_bool>(false);
+        const auto cancel = settlingCancel_;
+        const auto regionCopy = region;
+        latticeButton_->setEnabled(false);
+        settlingButton_->setEnabled(false);
+        openCadButton_->setEnabled(false);
+        selectEntryFaceButton_->setEnabled(false);
+        applyGeometryButton_->setEnabled(false);
+        cancelSettlingButton_->setEnabled(true);
+        resultLabel_->setText(QStringLiteral("准静态沉降计算中，可点击“停止准静态计算”"));
+        settlingWatcher_.setFuture(QtConcurrent::run(
+            [regionCopy, radius, options, cancel]() mutable {
+                options.cancellationRequested = [cancel] {
+                    return cancel->load();
+                };
+                return magazine::packing::settleWithoutFriction(
+                    regionCopy, radius, options);
+            }));
+    } catch (const std::exception& error) {
+        settlingRegion_.reset();
+        settlingCancel_.reset();
+        resultLabel_->setText(QStringLiteral("计算失败：%1")
+                                  .arg(QString::fromUtf8(error.what())));
+    }
+}
+
+void MainWindow::cancelSettling() {
+    if (!settlingCancel_) return;
+    settlingCancel_->store(true);
+    cancelSettlingButton_->setEnabled(false);
+    resultLabel_->setText(QStringLiteral("正在停止准静态沉降，请稍候…"));
+}
+
+void MainWindow::finishSettling() {
+    const bool cancelled = settlingCancel_ && settlingCancel_->load();
+    try {
+        const auto result = settlingWatcher_.result();
+        if (cancelled) {
+            resultLabel_->setText(QStringLiteral("准静态沉降已停止，未更新显示结果"));
+        } else if (settlingRegion_.has_value()) {
+            const auto validation = magazine::packing::validatePacking(
+                *settlingRegion_, result, 0.15);
+            presentPacking(*settlingRegion_, result);
+            const QString method = !cadRegion_.has_value()
+                ? QStringLiteral("无摩擦准静态沉降")
+                : QStringLiteral("无摩擦准静态沉降（CAD 真实内腔，已按用户重力方向对齐）");
+            showResult(method, result.centers.size(),
+                       QString::fromStdString(validation.message));
+        }
     } catch (const std::exception& error) {
         resultLabel_->setText(QStringLiteral("计算失败：%1")
                                   .arg(QString::fromUtf8(error.what())));
     }
+    settlingRegion_.reset();
+    settlingCancel_.reset();
+    latticeButton_->setEnabled(true);
+    settlingButton_->setEnabled(true);
+    openCadButton_->setEnabled(true);
+    selectEntryFaceButton_->setEnabled(true);
+    applyGeometryButton_->setEnabled(true);
+    cancelSettlingButton_->setEnabled(false);
 }
 
 void MainWindow::openCad() {

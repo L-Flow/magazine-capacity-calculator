@@ -2,6 +2,8 @@
 
 #include "packing/PackingRegion.hpp"
 
+#include <functional>
+
 namespace magazine::packing {
 
 struct SettlingOptions {
@@ -13,6 +15,8 @@ struct SettlingOptions {
     double initialLateralStepRadiusFactor{0.65};
     double minimumLateralStepMm{0.03};
     double improvementToleranceMm{1.0e-5};
+    // Optional cooperative cancellation hook for interactive callers.
+    std::function<bool()> cancellationRequested;
 };
 
 PackingResult settleWithoutFriction(const AxisAlignedBox& box, double radius,
@@ -21,4 +25,3 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
                                     const SettlingOptions& options = {});
 
 } // namespace magazine::packing
-

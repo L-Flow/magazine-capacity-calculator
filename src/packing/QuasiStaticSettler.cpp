@@ -75,14 +75,13 @@ private:
 Vec3 restingPosition(double x, double y, const PackingRegion& region,
                      const std::vector<Vec3>& centers,
                      const SupportIndex& supportIndex, double radius) {
+    const double supportHeight = supportIndex.restingHeight(
+        x, y, centers, radius, 0.0);
     const auto interval = region.verticalInterval(x, y, radius);
     if (!interval.has_value()) {
         return {x, y, std::numeric_limits<double>::infinity()};
     }
-    const double diameter = 2.0 * radius;
-    (void)diameter;
-    const double height = supportIndex.restingHeight(
-        x, y, centers, radius, interval->floorZ);
+    const double height = std::max(supportHeight, interval->floorZ);
     if (height > interval->ceilingZ + 1.0e-7) {
         return {x, y, std::numeric_limits<double>::infinity()};
     }
@@ -92,7 +91,7 @@ Vec3 restingPosition(double x, double y, const PackingRegion& region,
 Vec3 relaxDownhill(Vec3 candidate, const PackingRegion& region,
                    const std::vector<Vec3>& centers, double radius,
                    const SupportIndex& supportIndex,
-                   const SettlingOptions& options) {
+    const SettlingOptions& options) {
     double step = radius * options.initialLateralStepRadiusFactor;
     candidate = restingPosition(candidate.x, candidate.y, region, centers,
                                 supportIndex, radius);
@@ -101,10 +100,20 @@ Vec3 relaxDownhill(Vec3 candidate, const PackingRegion& region,
          iteration < options.maximumRelaxationIterations &&
          step >= options.minimumLateralStepMm;
          ++iteration) {
+        if (options.cancellationRequested &&
+            options.cancellationRequested()) {
+            return {candidate.x, candidate.y,
+                    std::numeric_limits<double>::infinity()};
+        }
         Vec3 best = candidate;
         bool improved = false;
         for (int direction = 0; direction < options.relaxationDirections;
              ++direction) {
+            if (options.cancellationRequested &&
+                options.cancellationRequested()) {
+                return {candidate.x, candidate.y,
+                        std::numeric_limits<double>::infinity()};
+            }
             const double angle =
                 2.0 * 3.14159265358979323846 * direction /
                 static_cast<double>(options.relaxationDirections);
@@ -112,6 +121,11 @@ Vec3 relaxDownhill(Vec3 candidate, const PackingRegion& region,
                        candidate.y + step * std::sin(angle), 0.0};
             if (trial.x < 0.0 || trial.x > region.bounds.widthMm ||
                 trial.y < 0.0 || trial.y > region.bounds.depthMm) {
+                continue;
+            }
+            const double supportHeight = supportIndex.restingHeight(
+                trial.x, trial.y, centers, radius, 0.0);
+            if (supportHeight + options.improvementToleranceMm >= best.z) {
                 continue;
             }
             trial = restingPosition(trial.x, trial.y, region, centers,
@@ -164,10 +178,18 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
     std::size_t rejected = 0;
 
     while (consecutiveFailures < options.failedInsertionsBeforeStop) {
+        if (options.cancellationRequested &&
+            options.cancellationRequested()) {
+            break;
+        }
         Vec3 best;
         best.z = std::numeric_limits<double>::infinity();
         for (std::size_t trialIndex = 0;
              trialIndex < options.candidateTrialsPerSphere; ++trialIndex) {
+            if (options.cancellationRequested &&
+                options.cancellationRequested()) {
+                break;
+            }
             Vec3 candidate{xDistribution(random), yDistribution(random), 0.0};
             candidate = relaxDownhill(candidate, region, centers, radius,
                                       supportIndex, options);

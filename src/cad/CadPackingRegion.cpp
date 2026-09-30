@@ -25,6 +25,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace magazine::cad {
@@ -48,6 +49,51 @@ struct FallbackCell {
     Bnd_Box bounds;
 };
 
+struct CellKey3 {
+    int x{0};
+    int y{0};
+    int z{0};
+
+    bool operator==(const CellKey3& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct CellKey3Hash {
+    std::size_t operator()(const CellKey3& key) const {
+        std::size_t hash = static_cast<std::size_t>(key.x) * 73856093U;
+        hash ^= static_cast<std::size_t>(key.y) * 19349663U;
+        hash ^= static_cast<std::size_t>(key.z) * 83492791U;
+        return hash;
+    }
+};
+
+struct VerticalIntervalKey {
+    int x{0};
+    int y{0};
+    int radius{0};
+
+    bool operator==(const VerticalIntervalKey& other) const {
+        return x == other.x && y == other.y && radius == other.radius;
+    }
+};
+
+struct VerticalIntervalKeyHash {
+    std::size_t operator()(const VerticalIntervalKey& key) const {
+        std::size_t hash = static_cast<std::size_t>(key.x) * 73856093U;
+        hash ^= static_cast<std::size_t>(key.y) * 19349663U;
+        hash ^= static_cast<std::size_t>(key.radius) * 83492791U;
+        return hash;
+    }
+};
+
+struct VerticalIntervalCache {
+    std::unordered_map<VerticalIntervalKey,
+                       std::optional<magazine::packing::VerticalInterval>,
+                       VerticalIntervalKeyHash>
+        values;
+};
+
 struct BoundaryFace {
     TopoDS_Face face;
     Bnd_Box bounds;
@@ -67,6 +113,8 @@ struct BoundaryConstraints {
     std::vector<PlaneConstraint> planes;
     std::vector<CylinderConstraint> cylinders;
     std::vector<FallbackCell> fallbackCells;
+    std::unordered_map<CellKey3, std::size_t, CellKey3Hash>
+        fallbackCellIndex;
     bool analytic{true};
 };
 
@@ -296,14 +344,33 @@ bool sphereInside(const CadImportResult& model,
     const gp_Pnt sourceCenter(center.x + model.minX,
                               center.y + model.minY,
                               center.z + model.minZ);
-    for (const FallbackCell& cell : constraints.fallbackCells) {
-        Bnd_Box candidateCell = cell.bounds;
-        candidateCell.Enlarge(radius + tolerance);
-        if (!candidateCell.IsOut(sourceCenter)) {
-            // The coarse cell is only a candidate index. The final decision
-            // must use the exact solid and face-clearance checks below.
-            return preciseSphereInside(model, constraints, center, radius,
-                                       tolerance);
+    if (!constraints.fallbackCells.empty()) {
+        constexpr double fallbackCellSize = 32.0;
+        const int centerX = static_cast<int>(std::floor(
+            (sourceCenter.X() - model.minX) / fallbackCellSize));
+        const int centerY = static_cast<int>(std::floor(
+            (sourceCenter.Y() - model.minY) / fallbackCellSize));
+        const int centerZ = static_cast<int>(std::floor(
+            (sourceCenter.Z() - model.minZ) / fallbackCellSize));
+        const int cellRange = static_cast<int>(std::ceil(
+            (radius + tolerance) / fallbackCellSize)) + 1;
+        for (int dx = -cellRange; dx <= cellRange; ++dx) {
+            for (int dy = -cellRange; dy <= cellRange; ++dy) {
+                for (int dz = -cellRange; dz <= cellRange; ++dz) {
+                    const auto it = constraints.fallbackCellIndex.find(
+                        {centerX + dx, centerY + dy, centerZ + dz});
+                    if (it == constraints.fallbackCellIndex.end()) continue;
+                    Bnd_Box candidateCell =
+                        constraints.fallbackCells[it->second].bounds;
+                    candidateCell.Enlarge(radius + tolerance);
+                    if (!candidateCell.IsOut(sourceCenter)) {
+                        // The coarse cell is only a candidate index. The final
+                        // decision must use exact solid and face checks.
+                        return preciseSphereInside(model, constraints, center,
+                                                   radius, tolerance);
+                    }
+                }
+            }
         }
     }
     if (analyticInside) return true;
@@ -424,7 +491,11 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                                 sourceSample.X() + sampleStep * 0.5,
                                 sourceSample.Y() + sampleStep * 0.5,
                                 sourceSample.Z() + sampleStep * 0.5);
+                    const std::size_t cellIndex =
+                        constraints.fallbackCells.size();
                     constraints.fallbackCells.push_back({cell});
+                    constraints.fallbackCellIndex.emplace(
+                        CellKey3{ix, iy, iz}, cellIndex);
                 }
             }
         }
@@ -436,7 +507,9 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
         const magazine::packing::Vec3& center, double radius, double tolerance) {
         return sphereInside(model, constraints, center, radius, tolerance);
     };
-    result.region.verticalInterval = [model, constraints, bounds](
+    const auto intervalCache = std::make_shared<VerticalIntervalCache>();
+    result.region.verticalInterval = [model, constraints, bounds,
+                                      intervalCache](
         double x, double y, double radius)
         -> std::optional<magazine::packing::VerticalInterval> {
         if (x < radius || x > bounds.widthMm - radius ||
@@ -444,13 +517,29 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
             return std::nullopt;
         }
 
+        // Reuse nearby column queries. The returned candidate is always
+        // checked again by containsSphere before it can be accepted, so this
+        // cache only avoids repeated expensive OCCT scans.
+        constexpr double cacheStep = 4.0;
+        const VerticalIntervalKey key{
+            static_cast<int>(std::llround(x / cacheStep)),
+            static_cast<int>(std::llround(y / cacheStep)),
+            static_cast<int>(std::llround(radius * 1000.0))};
+        const auto cached = intervalCache->values.find(key);
+        if (cached != intervalCache->values.end()) return cached->second;
+        const double sampledX = std::clamp(key.x * cacheStep, radius,
+                                           bounds.widthMm - radius);
+        const double sampledY = std::clamp(key.y * cacheStep, radius,
+                                           bounds.depthMm - radius);
+
         // Gravity has been transformed to -local Z.  Find the complete range
         // of sphere-center heights in this vertical column; this also handles
         // sloped, stepped, and cylindrical walls without assuming a box.
         const int scanSteps = 24;
         const double step = bounds.heightMm / scanSteps;
         auto valid = [&](double z) {
-            return sphereInside(model, constraints, {x, y, z}, radius,
+            return sphereInside(model, constraints, {sampledX, sampledY, z},
+                                radius,
                                 1.0e-5);
         };
         int first = -1;
@@ -461,7 +550,10 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                 last = index;
             }
         }
-        if (first < 0) return std::nullopt;
+        if (first < 0) {
+            intervalCache->values.emplace(key, std::nullopt);
+            return std::nullopt;
+        }
 
         auto refine = [&](double outside, double inside) {
             for (int iteration = 0; iteration < 18; ++iteration) {
@@ -478,7 +570,10 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
             ? bounds.heightMm
             : refine((last + 1) * step, last * step);
         if (upper + 1.0e-5 < lower) return std::nullopt;
-        return magazine::packing::VerticalInterval{lower, upper};
+        const auto result =
+            magazine::packing::VerticalInterval{lower, upper};
+        intervalCache->values.emplace(key, result);
+        return result;
     };
 
     if (!entryFace.IsNull()) {

@@ -23,8 +23,10 @@ ValidationReport validatePacking(const PackingRegion& region,
         : std::numeric_limits<double>::infinity();
 
     for (const Vec3& center : result.centers) {
-        if (!region.containsSphere(center, result.sphereRadiusMm,
-                                   allowedPenetrationMm)) {
+        // Keep the wall classification strict. allowedPenetrationMm is an
+        // overlap-reporting tolerance, not a license to place a sphere
+        // outside the CAD solid.
+        if (!region.containsSphere(center, result.sphereRadiusMm, 1.0e-5)) {
             report.allInside = false;
         }
     }
@@ -52,4 +54,3 @@ ValidationReport validatePacking(const PackingRegion& region,
 }
 
 } // namespace magazine::packing
-

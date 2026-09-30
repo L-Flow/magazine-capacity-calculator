@@ -36,7 +36,7 @@ if(MAGAZINE_BUILD_GUI)
         message(FATAL_ERROR "The first OCCT viewport implementation currently targets Windows")
     endif()
 
-    find_package(Qt5 5.15.2 EXACT REQUIRED COMPONENTS Widgets)
+    find_package(Qt5 5.15.2 EXACT REQUIRED COMPONENTS Widgets Concurrent)
 
     set(MAGAZINE_OCCT_LIBRARIES
         TKernel TKMath
@@ -129,7 +129,8 @@ if(MAGAZINE_BUILD_GUI)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${MAGAZINE_OCCT_INCLUDE_DIR})
     target_link_libraries(magazine-capacity-gui PRIVATE
-        packing_core cad_geometry Qt5::Widgets ${MAGAZINE_OCCT_LINK_LIBRARIES})
+        packing_core cad_geometry Qt5::Widgets Qt5::Concurrent
+        ${MAGAZINE_OCCT_LINK_LIBRARIES})
 
     foreach(occt_library IN LISTS MAGAZINE_OCCT_RUNTIME_LIBRARIES)
         if(NOT EXISTS "${MAGAZINE_OCCT_RUNTIME_DIR}/${occt_library}.dll")
@@ -142,7 +143,7 @@ if(MAGAZINE_BUILD_GUI)
                 "$<TARGET_FILE_DIR:magazine-capacity-gui>")
     endforeach()
 
-    foreach(qt_target IN ITEMS Qt5::Core Qt5::Gui Qt5::Widgets)
+    foreach(qt_target IN ITEMS Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Concurrent)
         add_custom_command(TARGET magazine-capacity-gui POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:${qt_target}>"
@@ -168,4 +169,3 @@ if(MAGAZINE_BUILD_GUI)
                 "$<TARGET_FILE_DIR:magazine-capacity-gui>/platforms")
     endif()
 endif()
-
