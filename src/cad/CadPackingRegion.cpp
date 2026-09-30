@@ -291,9 +291,7 @@ bool sphereInside(const CadImportResult& model,
     const bool analyticInside =
         constraints.analytic &&
         analyticSphereInside(model, constraints, center, radius, tolerance);
-    if (analyticInside) {
-        return true;
-    }
+    if (analyticInside && constraints.fallbackCells.empty()) return true;
 
     const gp_Pnt sourceCenter(center.x + model.minX,
                               center.y + model.minY,
@@ -308,6 +306,7 @@ bool sphereInside(const CadImportResult& model,
                                        tolerance);
         }
     }
+    if (analyticInside) return true;
     return constraints.analytic
         ? false
         : preciseSphereInside(model, constraints, center, radius, tolerance);
@@ -380,12 +379,12 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
     constraints.classifier =
         std::make_shared<BRepClass3d_SolidClassifier>(model.shape);
 
-    // Probe the non-convex remainder once. The analytic half-space test is
-    // deliberately conservative for a concave solid, so samples rejected by
-    // it are checked with OCCT and retained as coarse fallback cells when
-    // they are truly inside. Queries enlarge these cells by the active radius.
+    // Probe the non-convex remainder once. The analytic half-space test can
+    // be both conservative (rejecting valid concave regions) and permissive
+    // (accepting holes inside the convex hull), so retain coarse cells for
+    // both cases and resolve candidates in those cells with OCCT.
     if (constraints.analytic) {
-        constexpr double sampleStep = 64.0;
+        constexpr double sampleStep = 32.0;
         constexpr double maximumRadius = 21.0;
         const int countX = static_cast<int>(
             std::ceil(model.widthMm() / sampleStep));
@@ -403,15 +402,19 @@ CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                     const double z = std::min(
                         model.heightMm(), (iz + 0.5) * sampleStep);
                     const magazine::packing::Vec3 sample{x, y, z};
-                    if (analyticSphereInside(model, constraints, sample,
-                                             maximumRadius, 1.0e-5)) {
-                        continue;
-                    }
                     const gp_Pnt sourceSample(x + model.minX,
                                               y + model.minY,
                                               z + model.minZ);
+                    const bool analyticCenterInside = analyticSphereInside(
+                        model, constraints, sample, 0.0, 1.0e-5);
                     constraints.classifier->Perform(sourceSample, 1.0e-5);
-                    if (constraints.classifier->State() != TopAbs_IN) {
+                    const bool solidCenterInside =
+                        constraints.classifier->State() == TopAbs_IN;
+                    if (!solidCenterInside) {
+                        if (!analyticCenterInside) continue;
+                    } else if (analyticSphereInside(
+                                   model, constraints, sample, maximumRadius,
+                                   1.0e-5)) {
                         continue;
                     }
                     Bnd_Box cell;
