@@ -301,9 +301,7 @@ bool sphereInside(const CadImportResult& model,
     for (const FallbackCell& cell : constraints.fallbackCells) {
         Bnd_Box candidateCell = cell.bounds;
         candidateCell.Enlarge(radius + tolerance);
-        if (!candidateCell.IsOut(sourceCenter) &&
-            analyticSphereInside(model, constraints, center, 0.0,
-                                 tolerance)) {
+        if (!candidateCell.IsOut(sourceCenter)) {
             // The coarse cell is only a candidate index. The final decision
             // must use the exact solid and face-clearance checks below.
             return preciseSphereInside(model, constraints, center, radius,

@@ -47,7 +47,7 @@ QDoubleSpinBox* directionSpin(double value) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.4"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.1.5"));
     resize(1180, 760);
 
     auto* central = new QWidget;
