@@ -1217,14 +1217,14 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
                            grid->boundaryMinZ, grid->boundaryMaxX,
                            grid->boundaryMaxY, grid->boundaryMaxZ);
         grid->boundaryPadding = boundaryWindowPadding;
-        // The cavity is open on the side opposite gravity.  Use the upper
-        // edge of the selected-face envelope as a virtual entry gate.  This
-        // closes an open assembly against exterior air while still allowing
-        // the selected wall/floor faces to seed the component below it.
-        const double gateClearance = std::max(
-            2.0 * options.cellSizeMm, options.obstacleInflationMm + 1.0);
+        // The cavity is open on the side opposite gravity.  Use the actual
+        // upper edge of the selected-face envelope as the virtual entry gate.
+        // Adding a grid-cell clearance here lets sphere centers rise above the
+        // physical rim and creates a spurious final projectile layer.  The
+        // sphere-side test already subtracts the projectile radius, so no
+        // extra clearance is needed.
         grid->gatePoint = gp_Pnt(entryPoint.X(), entryPoint.Y(),
-                                 grid->boundaryMaxZ + gateClearance);
+                                 grid->boundaryMaxZ);
     }
     const double entryCenterX = pointMode ? entryPoint.X()
                                           : 0.5 * (entryMinX + entryMaxX);

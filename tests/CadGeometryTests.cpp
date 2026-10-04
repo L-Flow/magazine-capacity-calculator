@@ -278,6 +278,9 @@ int main() {
     require(!openExtracted.region.containsSphere({20.0, 20.0, 100.0}, 3.0,
                                                   1.0e-5),
             "finite selected boundary must reject exterior air above cavity");
+    require(!openExtracted.region.containsSphere({20.0, 20.0, 39.0}, 3.0,
+                                                  1.0e-5),
+            "open cavity must reject a sphere protruding above its selected rim");
 
     std::cout << "z-bounds=" << zAligned.region.bounds.widthMm << 'x'
               << zAligned.region.bounds.depthMm << 'x'

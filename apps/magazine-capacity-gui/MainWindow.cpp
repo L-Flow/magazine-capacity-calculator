@@ -80,7 +80,7 @@ QString explainAssemblyExtractionFailure(const QString& error) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.2.6 v11 边界实体保留版"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.2.7 v12 顶部边界修正版"));
     resize(1180, 760);
 
     auto* central = new QWidget;
