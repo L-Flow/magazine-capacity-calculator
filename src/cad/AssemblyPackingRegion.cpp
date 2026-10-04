@@ -512,6 +512,7 @@ struct AssemblyGrid {
         }
 
         for (const Obstacle& obstacle : obstacles) {
+            const double clearance = radius + tolerance;
             const double dx = std::max({obstacle.minX - centerPoint.X(),
                                         0.0,
                                         centerPoint.X() - obstacle.maxX});
@@ -521,15 +522,13 @@ struct AssemblyGrid {
             const double dz = std::max({obstacle.minZ - centerPoint.Z(),
                                         0.0,
                                         centerPoint.Z() - obstacle.maxZ});
-            if (dx * dx + dy * dy + dz * dz >
-                (radius + tolerance) * (radius + tolerance)) {
+            if (dx * dx + dy * dy + dz * dz > clearance * clearance) {
                 continue;
             }
             try {
                 ensureObstacleMesh(const_cast<Obstacle&>(obstacle));
                 if (!obstacle.triangles.empty()) {
-                    const double clearanceSquared =
-                        (radius + tolerance) * (radius + tolerance);
+                    const double clearanceSquared = clearance * clearance;
                     for (const Triangle& triangle : obstacle.triangles) {
                         if (pointTriangleDistanceSquared(centerPoint, triangle) <=
                             clearanceSquared) {
@@ -1003,6 +1002,35 @@ void cropToReachableComponent(const std::shared_ptr<AssemblyGrid>& grid,
     grid->rebuildObstacleIndex();
 }
 
+std::optional<magazine::packing::VerticalInterval> coarseIntervalForColumn(
+    const std::shared_ptr<AssemblyGrid>& grid, double x, double y,
+    double radius) {
+    if (x < radius || x > grid->bounds.widthMm - radius ||
+        y < radius || y > grid->bounds.depthMm - radius) {
+        return std::nullopt;
+    }
+    const int cx = static_cast<int>(std::floor(x / grid->cellSize));
+    const int cy = static_cast<int>(std::floor(y / grid->cellSize));
+    if (!grid->inBounds(cx, cy, 0)) return std::nullopt;
+    int first = -1;
+    int last = -1;
+    bool contiguous = true;
+    for (int z = 0; z < grid->nz; ++z) {
+        if (grid->reachable[grid->index(cx, cy, z)] == 0) {
+            if (first >= 0 && last != z - 1) contiguous = false;
+            continue;
+        }
+        if (first < 0) first = z;
+        if (last >= 0 && z != last + 1) contiguous = false;
+        last = z;
+    }
+    if (first < 0 || last < first || !contiguous) return std::nullopt;
+    const double lower = first * grid->cellSize + radius;
+    const double upper = (last + 1) * grid->cellSize - radius;
+    if (lower > upper + 1.0e-7) return std::nullopt;
+    return magazine::packing::VerticalInterval{lower, upper};
+}
+
 std::optional<magazine::packing::VerticalInterval> intervalForColumn(
     const std::shared_ptr<AssemblyGrid>& grid, double x, double y,
     double radius, double tolerance) {
@@ -1454,6 +1482,11 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
     result.region.verticalInterval = [grid](double x, double y, double radius)
         -> std::optional<magazine::packing::VerticalInterval> {
         return intervalForColumn(grid, x, y, radius, 1.0e-5);
+    };
+    result.region.coarseVerticalInterval =
+        [grid](double x, double y, double radius)
+            -> std::optional<magazine::packing::VerticalInterval> {
+        return coarseIntervalForColumn(grid, x, y, radius);
     };
     result.region.entryFace = magazine::packing::EntryFaceInfo{
         {entryPoint.X() - grid->origin.X(),

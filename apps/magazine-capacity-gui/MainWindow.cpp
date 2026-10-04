@@ -80,7 +80,7 @@ QString explainAssemblyExtractionFailure(const QString& error) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.2.7 v12 顶部边界修正版"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.2.8 v13 沉降加速版"));
     resize(1180, 760);
 
     auto* central = new QWidget;
@@ -249,6 +249,15 @@ void MainWindow::runSettling() {
         const auto fallback = magazine::packing::boxPackingRegion(inputBox);
         const auto& region = cadRegion_.has_value() ? *cadRegion_ : fallback;
         magazine::packing::SettlingOptions options;
+        if (cadRegion_.has_value()) {
+            // CAD clearance is much more expensive than box clearance.  The
+            // lower trial budget reaches the same jammed region in a fraction
+            // of the time while the final exact validation remains unchanged.
+            options.failedInsertionsBeforeStop = 72;
+            options.candidateTrialsPerSphere = 12;
+            options.relaxationDirections = 10;
+            options.maximumRelaxationIterations = 18;
+        }
         settlingRegion_ = region;
         settlingCancel_ = std::make_shared<std::atomic_bool>(false);
         const auto cancel = settlingCancel_;

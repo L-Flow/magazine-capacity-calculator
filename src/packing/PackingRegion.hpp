@@ -23,6 +23,8 @@ struct PackingRegion {
     std::function<std::optional<VerticalInterval>(double, double, double)>
         verticalInterval;
     std::optional<EntryFaceInfo> entryFace;
+    std::function<std::optional<VerticalInterval>(double, double, double)>
+        coarseVerticalInterval;
 
     bool validFor(double radius) const {
         return bounds.validFor(radius) && containsSphere && verticalInterval;

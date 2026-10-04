@@ -6,6 +6,7 @@
 #include "packing/Validation.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -30,7 +31,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wcerr << L"usage: cad-capacity <model.step> [diameter-mm]\n"
                    << L"   or: cad-capacity --assembly <model.step> "
                       L"<face-index> <gx> <gy> <gz> [diameter-mm] [cell-mm] "
-                      L"[--extract-only]\n";
+                      L"[--extract-only|--settle]\n";
         return EXIT_FAILURE;
     }
     try {
@@ -52,7 +53,9 @@ int wmain(int argc, wchar_t** argv) {
             if (argc >= 9) extraction.cellSizeMm = std::stod(argv[8]);
             const bool extractOnly = argc == 10 &&
                                      std::wstring(argv[9]) == L"--extract-only";
-            if (argc == 10 && !extractOnly) {
+            const bool settleMode = argc == 10 &&
+                                    std::wstring(argv[9]) == L"--settle";
+            if (argc == 10 && !extractOnly && !settleMode) {
                 throw std::invalid_argument("unknown assembly option");
             }
             const auto assembly = magazine::cad::makeAssemblyPackingRegion(
@@ -69,14 +72,32 @@ int wmain(int argc, wchar_t** argv) {
                       << std::flush;
             if (extractOnly) return EXIT_SUCCESS;
             const double radius = diameter / 2.0;
-            magazine::packing::LatticeOptions latticeOptions;
-            latticeOptions.phaseDivisions = 2;
-            const auto lattice = magazine::packing::packBestFccOrHcp(
-                assembly.region, radius, latticeOptions);
-            const auto check = magazine::packing::validatePacking(
-                assembly.region, lattice);
-            std::cout << "lattice: " << lattice.centers.size() << " ("
-                      << lattice.method << "), " << check.message << '\n';
+            if (settleMode) {
+                magazine::packing::SettlingOptions options;
+                options.failedInsertionsBeforeStop = 72;
+                options.candidateTrialsPerSphere = 12;
+                options.relaxationDirections = 10;
+                options.maximumRelaxationIterations = 18;
+                const auto start = std::chrono::steady_clock::now();
+                const auto settled = magazine::packing::settleWithoutFriction(
+                    assembly.region, radius, options);
+                const auto elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                const auto settledCheck = magazine::packing::validatePacking(
+                    assembly.region, settled, 0.15);
+                std::cout << "settled: " << settled.centers.size() << ", "
+                          << settledCheck.message << ", elapsed-s: "
+                          << elapsed << '\n';
+            } else {
+                magazine::packing::LatticeOptions latticeOptions;
+                latticeOptions.phaseDivisions = 2;
+                const auto lattice = magazine::packing::packBestFccOrHcp(
+                    assembly.region, radius, latticeOptions);
+                const auto check = magazine::packing::validatePacking(
+                    assembly.region, lattice);
+                std::cout << "lattice: " << lattice.centers.size() << " ("
+                          << lattice.method << "), " << check.message << '\n';
+            }
             return EXIT_SUCCESS;
         }
         const double diameter = argc == 3 ? std::stod(argv[2]) : 17.0;

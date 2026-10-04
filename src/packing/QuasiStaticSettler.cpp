@@ -77,6 +77,16 @@ Vec3 restingPosition(double x, double y, const PackingRegion& region,
                      const SupportIndex& supportIndex, double radius) {
     const double supportHeight = supportIndex.restingHeight(
         x, y, centers, radius, 0.0);
+    if (region.coarseVerticalInterval) {
+        const auto coarse = region.coarseVerticalInterval(x, y, radius);
+        if (coarse.has_value()) {
+            const double coarseHeight =
+                std::max(supportHeight, coarse->floorZ);
+            if (coarseHeight <= coarse->ceilingZ + 1.0e-7) {
+                return {x, y, coarseHeight};
+            }
+        }
+    }
     const auto interval = region.verticalInterval(x, y, radius);
     if (!interval.has_value()) {
         return {x, y, std::numeric_limits<double>::infinity()};
@@ -184,6 +194,8 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
         }
         Vec3 best;
         best.z = std::numeric_limits<double>::infinity();
+        std::vector<Vec3> candidates;
+        candidates.reserve(options.candidateTrialsPerSphere);
         for (std::size_t trialIndex = 0;
              trialIndex < options.candidateTrialsPerSphere; ++trialIndex) {
             if (options.cancellationRequested &&
@@ -193,13 +205,29 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
             Vec3 candidate{xDistribution(random), yDistribution(random), 0.0};
             candidate = relaxDownhill(candidate, region, centers, radius,
                                       supportIndex, options);
-            if (candidate.z < best.z &&
-                region.containsSphere(candidate, radius, 1.0e-5)) {
-                best = candidate;
-            }
+            if (std::isfinite(candidate.z)) candidates.push_back(candidate);
         }
 
-        if (std::isfinite(best.z)) {
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Vec3& lhs, const Vec3& rhs) {
+                      if (lhs.z != rhs.z) return lhs.z < rhs.z;
+                      if (lhs.y != rhs.y) return lhs.y < rhs.y;
+                      return lhs.x < rhs.x;
+                  });
+        bool accepted = false;
+        if (!region.coarseVerticalInterval && !candidates.empty()) {
+            best = candidates.front();
+            accepted = true;
+        } else {
+            for (const Vec3& candidate : candidates) {
+                if (region.containsSphere(candidate, radius, 1.0e-5)) {
+                    best = candidate;
+                    accepted = true;
+                    break;
+                }
+            }
+        }
+        if (accepted) {
             centers.push_back(best);
             supportIndex.insert(best, centers.size() - 1);
             consecutiveFailures = 0;
