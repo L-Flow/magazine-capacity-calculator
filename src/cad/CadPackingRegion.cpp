@@ -382,9 +382,10 @@ bool sphereInside(const CadImportResult& model,
 CadPackingRegion makeLocalPackingRegion(const CadImportResult& model,
                                         const TopoDS_Face& entryFace,
                                         const gp_Dir& sourceGravity) {
-    if (model.solidCount != 1 || model.shape.IsNull()) {
+    if (!model.topologyValid || model.solidCount != 1 || model.shape.IsNull()) {
         throw std::invalid_argument(
-            "CAD packing region requires exactly one non-null solid");
+            "single-solid CAD packing requires valid topology; use assembly "
+            "extraction for multi-part or malformed assemblies");
     }
     const magazine::packing::AxisAlignedBox bounds{
         model.widthMm(), model.depthMm(), model.heightMm()};

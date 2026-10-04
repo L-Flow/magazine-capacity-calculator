@@ -23,6 +23,11 @@ struct CadImportResult {
     std::size_t solidCount{0};
     std::size_t shellCount{0};
     std::size_t faceCount{0};
+    // Assembly exports often contain one malformed or intentionally open
+    // component even though the remaining solids are usable as obstacles.
+    // Keep that diagnostic separate from the import result so the assembly
+    // extraction path can continue and report the limitation to the user.
+    bool topologyValid{true};
 
     double widthMm() const { return maxX - minX; }
     double depthMm() const { return maxY - minY; }

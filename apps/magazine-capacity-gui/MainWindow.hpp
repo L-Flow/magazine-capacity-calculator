@@ -3,13 +3,17 @@
 #include <QFutureWatcher>
 #include <QMainWindow>
 #include <QString>
+#include <gp_Dir.hxx>
+#include <gp_Pnt.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <optional>
 #include <atomic>
 #include <memory>
+#include <vector>
 
 #include "cad/CadImporter.hpp"
+#include "cad/AssemblyPackingRegion.hpp"
 #include "packing/PackingRegion.hpp"
 
 class QComboBox;
@@ -29,10 +33,14 @@ private:
     void runSettling();
     void cancelSettling();
     void finishSettling();
+    void finishAssemblyExtraction();
     void openCad();
     void beginFaceSelection();
+    void beginPointSelection();
     void applyGeometrySettings();
-    void handleFaceSelected(const TopoDS_Face& face);
+    void handleFacesSelected(const std::vector<TopoDS_Face>& faces);
+    void handlePointSelected(const gp_Pnt& seed, const gp_Pnt& entry,
+                             const TopoDS_Face& face);
     void showResult(const QString& label, std::size_t count,
                     const QString& validation);
     void presentPacking(const magazine::packing::PackingRegion& region,
@@ -50,6 +58,7 @@ private:
     QPushButton* cancelSettlingButton_{nullptr};
     QPushButton* openCadButton_{nullptr};
     QPushButton* selectEntryFaceButton_{nullptr};
+    QPushButton* selectInteriorPointButton_{nullptr};
     QPushButton* applyGeometryButton_{nullptr};
     QLabel* cadLabel_{nullptr};
     QLabel* resultLabel_{nullptr};
@@ -59,9 +68,17 @@ private:
     bool hasImportedCad_{false};
     TopoDS_Face entryFace_;
     bool hasEntryFace_{false};
+    std::vector<TopoDS_Face> boundaryFaces_;
+    bool hasBoundaryFaces_{false};
+    gp_Pnt entrySeedPoint_;
+    gp_Pnt entryGatePoint_;
+    bool hasEntryPoint_{false};
     std::optional<magazine::packing::PackingRegion> cadRegion_;
+    std::optional<magazine::cad::AssemblyPackingRegion> assemblyRegion_;
     QString cadDescription_;
     QFutureWatcher<magazine::packing::PackingResult> settlingWatcher_;
     std::shared_ptr<std::atomic_bool> settlingCancel_;
     std::optional<magazine::packing::PackingRegion> settlingRegion_;
+    QFutureWatcher<magazine::cad::AssemblyPackingRegion> assemblyWatcher_;
+    std::optional<gp_Dir> pendingGravity_;
 };

@@ -101,9 +101,7 @@ CadImportResult readCad(const std::filesystem::path& path) {
         throw CadImportError("unsupported CAD extension: " + extension);
     }
 
-    if (!BRepCheck_Analyzer(result.shape).IsValid()) {
-        throw CadImportError("CAD model topology is invalid");
-    }
+    result.topologyValid = BRepCheck_Analyzer(result.shape).IsValid();
     collectShapeStats(result);
     return result;
 }

@@ -5,8 +5,10 @@
 
 #include <memory>
 #include <functional>
+#include <vector>
 
 #include <QWidget>
+#include <gp_Pnt.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 
@@ -20,7 +22,11 @@ class QWheelEvent;
 
 class OcctViewport final : public QWidget {
 public:
-    using FaceSelectionCallback = std::function<void(const TopoDS_Face&)>;
+    using FaceSelectionCallback =
+        std::function<void(const std::vector<TopoDS_Face>&)>;
+    using PointSelectionCallback =
+        std::function<void(const gp_Pnt&, const gp_Pnt&, const TopoDS_Face&)>;
+    using PointSelectionRejectedCallback = std::function<void(const QString&)>;
 
     explicit OcctViewport(QWidget* parent = nullptr);
     ~OcctViewport() override;
@@ -31,6 +37,12 @@ public:
     void clearPacking();
     void setFaceSelectionEnabled(bool enabled);
     void setFaceSelectionCallback(FaceSelectionCallback callback);
+    void clearFaceSelection();
+    void setPointSelectionEnabled(bool enabled);
+    void setPointSelectionCallback(PointSelectionCallback callback);
+    void setPointSelectionRejectedCallback(
+        PointSelectionRejectedCallback callback);
+    void clearSelectionMarker();
     void fitAll();
     bool saveSnapshot(const QString& path);
 

@@ -95,6 +95,8 @@ if(MAGAZINE_BUILD_GUI)
         src/cad/CadImporter.hpp
         src/cad/CadPackingRegion.cpp
         src/cad/CadPackingRegion.hpp
+        src/cad/AssemblyPackingRegion.cpp
+        src/cad/AssemblyPackingRegion.hpp
     )
     target_include_directories(cad_geometry PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src
