@@ -14,6 +14,7 @@
 
 #include "cad/CadImporter.hpp"
 #include "cad/AssemblyPackingRegion.hpp"
+#include "packing/LatticePacking.hpp"
 #include "packing/PackingRegion.hpp"
 
 class QComboBox;
@@ -74,6 +75,7 @@ private:
     gp_Pnt entryGatePoint_;
     bool hasEntryPoint_{false};
     std::optional<magazine::packing::PackingRegion> cadRegion_;
+    std::optional<magazine::packing::PackingResult> latticeReference_;
     std::optional<magazine::cad::AssemblyPackingRegion> assemblyRegion_;
     QString cadDescription_;
     QFutureWatcher<magazine::packing::PackingResult> settlingWatcher_;

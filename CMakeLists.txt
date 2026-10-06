@@ -125,7 +125,11 @@ if(MAGAZINE_BUILD_GUI)
         apps/magazine-capacity-gui/MainWindow.hpp
         apps/magazine-capacity-gui/OcctViewport.cpp
         apps/magazine-capacity-gui/OcctViewport.hpp
+        apps/magazine-capacity-gui/app-icon.rc
     )
+    qt5_add_resources(MAGAZINE_GUI_RESOURCES
+        apps/magazine-capacity-gui/app-icon.qrc)
+    target_sources(magazine-capacity-gui PRIVATE ${MAGAZINE_GUI_RESOURCES})
     target_include_directories(magazine-capacity-gui PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/apps/magazine-capacity-gui
         ${CMAKE_CURRENT_SOURCE_DIR}/src

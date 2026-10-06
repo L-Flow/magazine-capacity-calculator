@@ -53,6 +53,10 @@ struct PackingResult {
     std::vector<Vec3> centers;
     std::size_t rejectedCount{0};
     std::uint64_t seed{0};
+    // The solver may return a valid partial packing when an interactive
+    // caller reaches its runtime budget or requests cancellation.
+    bool stoppedByTimeLimit{false};
+    bool stoppedByCancellation{false};
 };
 
 } // namespace magazine::packing

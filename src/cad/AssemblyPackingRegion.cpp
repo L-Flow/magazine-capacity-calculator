@@ -36,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace magazine::cad {
@@ -232,9 +233,18 @@ struct AssemblyGrid {
     // A strict multi-face selection intersects every face's tangential
     // footprint.  STEP tessellation, split faces, and tiny modeling gaps can
     // make that intersection empty even when the selected planes do enclose
-    // a real cavity.  Extraction may retry with the union envelope while
-    // retaining the global one-sided plane constraints.
+    // a real cavity. Extraction may retry with a seed-localized envelope
+    // while retaining the global one-sided plane constraints.
     bool enforceTangentialIntersection{true};
+    // When the exact intersection of all selected-face tangent footprints is
+    // empty, keep the connected interval that contains the user seed on each
+    // axis instead of reverting to the union of every selected face.  This is
+    // important for assemblies where the selection contains split faces or
+    // faces from two separated pockets.
+    bool localizedBoundaryWindow{false};
+    std::array<double, 3> localizedMinimumSpan{{0.0, 0.0, 0.0}};
+    std::array<bool, 2> unconstrainedHorizontalAxis{{false, false}};
+    std::array<bool, 2> unconstrainedFarUpper{{false, false}};
     double apertureMinX{-std::numeric_limits<double>::infinity()};
     double apertureMaxX{std::numeric_limits<double>::infinity()};
     double apertureMinY{-std::numeric_limits<double>::infinity()};
@@ -264,7 +274,10 @@ struct AssemblyGrid {
 
     bool onMagazineSide(const gp_Pnt& point) const {
         const gp_Vec fromEntry(boundaryMode ? gatePoint : entryPoint, point);
-        return fromEntry.Dot(gp_Vec(gateNormal)) >= -cellSize;
+        // A whole extra grid cell above the opening lets flood fill walk
+        // around a wall's top edge and then back into exterior vehicle air.
+        // Sphere clearance applies its own radius margin separately.
+        return fromEntry.Dot(gp_Vec(gateNormal)) >= -1.0e-6;
     }
 
     bool insideBoundaryEnvelope(const gp_Pnt& point) const {
@@ -573,6 +586,183 @@ gp_Dir faceNormal(const TopoDS_Face& face, const gp_Dir& fallback) {
     return normal;
 }
 
+void localizeBoundaryWindowToSeed(const std::shared_ptr<AssemblyGrid>& grid,
+                                  const gp_Pnt& seed) {
+    if (!grid->boundaryMode || !grid->hasBoundaryBounds ||
+        grid->enforceTangentialIntersection || grid->boundaryConstraints.empty()) {
+        return;
+    }
+
+    const double coordinates[3] = {seed.X(), seed.Y(), seed.Z()};
+    const double originalLower[3] = {grid->boundaryMinX, grid->boundaryMinY,
+                                     grid->boundaryMinZ};
+    const double originalUpper[3] = {grid->boundaryMaxX, grid->boundaryMaxY,
+                                     grid->boundaryMaxZ};
+    const double mergePadding = 2.0 * grid->cellSize;
+    double localizedLower[3] = {originalLower[0], originalLower[1],
+                                originalLower[2]};
+    double localizedUpper[3] = {originalUpper[0], originalUpper[1],
+                                originalUpper[2]};
+    bool changed = false;
+
+    for (int axis = 0; axis < 3; ++axis) {
+        if (axis < 2 && grid->enforceGlobalBoundaryPlanes) {
+            bool lowerWall = false;
+            bool upperWall = false;
+            for (const auto& constraint : grid->boundaryConstraints) {
+                if (constraint.normalAxis != axis) continue;
+                const double component = axis == 0
+                    ? constraint.normal.X() : constraint.normal.Y();
+                lowerWall = lowerWall || component > 0.5;
+                upperWall = upperWall || component < -0.5;
+            }
+            if (lowerWall || upperWall) {
+                // Planes normal to this axis already give a physical side of
+                // the cavity. Tangential projections of split faces on other
+                // walls must not replace that side with a narrow interval.
+                if (lowerWall && upperWall) continue;
+                if (originalUpper[axis] - originalLower[axis] >=
+                    grid->localizedMinimumSpan[axis]) {
+                    continue;
+                }
+                // Only one selected side is known and its AABB is too thin.
+                // Search across the model for the real opposite solid wall.
+                localizedLower[axis] = 0.0;
+                localizedUpper[axis] = axis == 0
+                    ? grid->bounds.widthMm : grid->bounds.depthMm;
+                grid->unconstrainedHorizontalAxis[axis] = true;
+                grid->unconstrainedFarUpper[axis] = lowerWall;
+                changed = true;
+                continue;
+            }
+        }
+        std::vector<std::pair<double, double>> intervals;
+        for (const auto& constraint : grid->boundaryConstraints) {
+            if (axis == constraint.normalAxis || constraint.bounds.IsVoid()) {
+                continue;
+            }
+            double minX = 0.0;
+            double minY = 0.0;
+            double minZ = 0.0;
+            double maxX = 0.0;
+            double maxY = 0.0;
+            double maxZ = 0.0;
+            constraint.bounds.Get(minX, minY, minZ, maxX, maxY, maxZ);
+            const double lower[3] = {minX, minY, minZ};
+            const double upper[3] = {maxX, maxY, maxZ};
+            if (upper[axis] >= lower[axis]) {
+                intervals.emplace_back(lower[axis], upper[axis]);
+            }
+        }
+        if (intervals.empty()) continue;
+
+        std::sort(intervals.begin(), intervals.end(),
+                  [](const auto& lhs, const auto& rhs) {
+                      if (lhs.first != rhs.first) return lhs.first < rhs.first;
+                      return lhs.second < rhs.second;
+                  });
+        std::vector<std::pair<double, double>> merged;
+        for (const auto& interval : intervals) {
+            if (merged.empty() ||
+                interval.first > merged.back().second + mergePadding) {
+                merged.push_back(interval);
+            } else {
+                merged.back().second =
+                    std::max(merged.back().second, interval.second);
+            }
+        }
+
+        std::size_t selected = 0;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (std::size_t index = 0; index < merged.size(); ++index) {
+            const auto& interval = merged[index];
+            const double distance =
+                coordinates[axis] < interval.first
+                    ? interval.first - coordinates[axis]
+                    : coordinates[axis] > interval.second
+                          ? coordinates[axis] - interval.second
+                          : 0.0;
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                selected = index;
+            }
+            if (distance <= mergePadding) break;
+        }
+        // A single interval can still be only the thickness of one selected
+        // side wall. In the fallback path the finite AABB is merely a seed
+        // window; the selected face planes and exact solids provide the real
+        // cavity boundary. Keep a separated interval when there are several,
+        // but allow a single narrow interval to grow around the seed below.
+        double lower = merged.size() > 1
+            ? merged[selected].first
+            : originalLower[axis];
+        double upper = merged.size() > 1
+            ? merged[selected].second
+            : originalUpper[axis];
+        if (coordinates[axis] < lower) lower = coordinates[axis];
+        if (coordinates[axis] > upper) upper = coordinates[axis];
+        const double minimumSpan = grid->localizedMinimumSpan[axis];
+        // A single connected projection may be a narrow split of a wider
+        // cavity, so it is safe to grow it around the selected seed.  When
+        // projections are genuinely separated, keep only the seed interval;
+        // growing it would bridge two independent pockets again.
+        if (merged.size() == 1 && minimumSpan > 0.0 &&
+            upper - lower < minimumSpan) {
+            const double modelLower = 0.0;
+            const double modelUpper = axis == 0
+                ? grid->bounds.widthMm
+                : axis == 1
+                      ? grid->bounds.depthMm
+                      : grid->bounds.heightMm;
+            const double halfSpan = 0.5 * minimumSpan;
+            lower = coordinates[axis] - halfSpan;
+            upper = coordinates[axis] + halfSpan;
+            if (lower < modelLower) {
+                upper += modelLower - lower;
+                lower = modelLower;
+            }
+            if (upper > modelUpper) {
+                lower -= upper - modelUpper;
+                upper = modelUpper;
+            }
+            lower = std::max(modelLower, lower);
+            upper = std::min(modelUpper, upper);
+        }
+        // Do not clip an expanded fallback back to the selected-face AABB.
+        // A wall face can be only a narrow split/step of a much wider cavity;
+        // the selected planes and exact solid checks remain the authoritative
+        // boundaries after this seed-local window is enlarged.
+        const double modelLower = 0.0;
+        const double modelUpper = axis == 0
+            ? grid->bounds.widthMm
+            : axis == 1
+                  ? grid->bounds.depthMm
+                  : grid->bounds.heightMm;
+        const double expandedLower = std::max(modelLower, lower);
+        const double expandedUpper = std::min(modelUpper, upper);
+        localizedLower[axis] = expandedLower;
+        localizedUpper[axis] = expandedUpper;
+        changed = changed || expandedLower > originalLower[axis] + 1.0e-7 ||
+                  expandedUpper < originalUpper[axis] - 1.0e-7 ||
+                  expandedLower < originalLower[axis] - 1.0e-7 ||
+                  expandedUpper > originalUpper[axis] + 1.0e-7;
+    }
+
+    if (!changed) return;
+
+    grid->boundaryMinX = localizedLower[0];
+    grid->boundaryMinY = localizedLower[1];
+    grid->boundaryMinZ = localizedLower[2];
+    grid->boundaryMaxX = localizedUpper[0];
+    grid->boundaryMaxY = localizedUpper[1];
+    grid->boundaryMaxZ = localizedUpper[2];
+    // The virtual gate follows the localized upper rim so a taller, separate
+    // selected pocket cannot lift the top boundary of the seeded one.
+    grid->gatePoint = gp_Pnt(grid->gatePoint.X(), grid->gatePoint.Y(),
+                             grid->boundaryMaxZ);
+    grid->localizedBoundaryWindow = true;
+}
+
 LocalFrame makeFrame(const CadImportResult& model,
                      const gp_Dir& gravity,
                      const TopoDS_Face& entryFace) {
@@ -866,6 +1056,48 @@ void orientBoundaryConstraintsToSeed(
     }
 }
 
+bool strictTangentialWindowIsNarrow(const AssemblyGrid& grid) {
+    if (!grid.enforceGlobalBoundaryPlanes ||
+        grid.boundaryConstraints.empty()) return false;
+    for (int axis = 0; axis < 2; ++axis) {
+        const double selectedSpan = axis == 0
+            ? grid.boundaryMaxX - grid.boundaryMinX
+            : grid.boundaryMaxY - grid.boundaryMinY;
+        bool lowerWall = false;
+        bool upperWall = false;
+        for (const auto& constraint : grid.boundaryConstraints) {
+            if (constraint.normalAxis != axis) continue;
+            const double component = axis == 0
+                ? constraint.normal.X() : constraint.normal.Y();
+            lowerWall = lowerWall || component > 0.5;
+            upperWall = upperWall || component < -0.5;
+        }
+        if ((lowerWall != upperWall) &&
+            selectedSpan < grid.localizedMinimumSpan[axis]) {
+            return true;
+        }
+        double lower = -std::numeric_limits<double>::infinity();
+        double upper = std::numeric_limits<double>::infinity();
+        for (const auto& constraint : grid.boundaryConstraints) {
+            if (constraint.normalAxis == axis || constraint.bounds.IsVoid()) {
+                continue;
+            }
+            double minX = 0.0, minY = 0.0, minZ = 0.0;
+            double maxX = 0.0, maxY = 0.0, maxZ = 0.0;
+            constraint.bounds.Get(minX, minY, minZ, maxX, maxY, maxZ);
+            const double minima[2] = {minX, minY};
+            const double maxima[2] = {maxX, maxY};
+            lower = std::max(lower, minima[axis] - 2.0 * grid.cellSize);
+            upper = std::min(upper, maxima[axis] + 2.0 * grid.cellSize);
+        }
+        if (std::isfinite(lower) && std::isfinite(upper) &&
+            upper - lower < grid.localizedMinimumSpan[axis]) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void floodFill(const std::shared_ptr<AssemblyGrid>& grid,
                const gp_Pnt& seed, std::size_t maximumCells) {
     const int seedX = static_cast<int>(std::floor(seed.X() / grid->cellSize));
@@ -908,6 +1140,35 @@ void floodFill(const std::shared_ptr<AssemblyGrid>& grid,
                 throw std::invalid_argument(
                     "assembly free-space extraction exceeded the cell limit; "
                     "crop the assembly or increase the limit");
+            }
+        }
+    }
+}
+
+void rejectUnboundedHorizontalFlood(const std::shared_ptr<AssemblyGrid>& grid) {
+    if (!grid->unconstrainedHorizontalAxis[0] &&
+        !grid->unconstrainedHorizontalAxis[1]) {
+        return;
+    }
+    for (int z = 0; z < grid->nz; ++z) {
+        for (int y = 0; y < grid->ny; ++y) {
+            for (int x = 0; x < grid->nx; ++x) {
+                if (grid->reachable[grid->index(x, y, z)] == 0) continue;
+                if ((grid->unconstrainedHorizontalAxis[0] &&
+                     x == (grid->unconstrainedFarUpper[0]
+                               ? grid->nx - 1 : 0)) ||
+                    (grid->unconstrainedHorizontalAxis[1] &&
+                     y == (grid->unconstrainedFarUpper[1]
+                               ? grid->ny - 1 : 0))) {
+                    throw std::invalid_argument(
+                        "selected faces do not bound the cavity on one horizontal axis; "
+                        "the reachable region touches the assembly edge at cell (" +
+                        std::to_string(x) + ", " + std::to_string(y) + ", " +
+                        std::to_string(z) + ") in grid " +
+                        std::to_string(grid->nx) + "x" +
+                        std::to_string(grid->ny) + "x" +
+                        std::to_string(grid->nz) + ". Select an opposing inner wall face");
+                }
             }
         }
     }
@@ -1245,6 +1506,18 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
                            grid->boundaryMinZ, grid->boundaryMaxX,
                            grid->boundaryMaxY, grid->boundaryMaxZ);
         grid->boundaryPadding = boundaryWindowPadding;
+        // If the selected-face intervals split into separate components, keep
+        // at least a useful local window for a normal magazine axis.  A single
+        // side-wall projection may be expanded during fallback; separated
+        // intervals remain seed-localized so distant pockets are not merged.
+        grid->localizedMinimumSpan = {
+            std::max(4.0 * options.cellSizeMm,
+                     options.minimumEntryApertureWidthMm -
+                         2.0 * grid->boundaryPadding),
+            std::max(4.0 * options.cellSizeMm,
+                     options.minimumEntryApertureDepthMm -
+                         2.0 * grid->boundaryPadding),
+            0.0};
         // The cavity is open on the side opposite gravity.  Use the actual
         // upper edge of the selected-face envelope as the virtual entry gate.
         // Adding a grid-cell clearance here lets sphere centers rise above the
@@ -1402,6 +1675,14 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
     }
     grid->enforceGlobalBoundaryPlanes =
         boundaryMode && grid->boundaryConstraints.size() > 1;
+    // A nonempty intersection can still be just a narrow fragment of the
+    // cavity. In particular, a short floor patch can clip the normal axis of
+    // a selected side wall even though the opposite wall is a real solid.
+    // Treat that case like an empty intersection and let the seed, oriented
+    // wall planes, and solid collision determine the reachable component.
+    if (seedPoint.has_value() && strictTangentialWindowIsNarrow(*grid)) {
+        grid->enforceTangentialIntersection = false;
+    }
 
     std::optional<gp_Pnt> seed;
     if (seedPoint.has_value()) {
@@ -1468,7 +1749,18 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
             "could not find free space behind the selected entry; "
             "click a visible point in the intended cavity or select its opening boundary");
     }
+    // A failed strict tangent intersection used to fall back to the union
+    // AABB of every selected face.  Localize that fallback around the actual
+    // free-space seed before flood filling, otherwise separated pockets can
+    // be admitted into one apparent magazine.
+    localizeBoundaryWindowToSeed(grid, *seed);
+    if (!useSelectedSeed(grid, *seed)) {
+        throw std::invalid_argument(
+            "selected boundary fallback does not contain the chosen interior point; "
+            "select boundary faces from one target cavity");
+    }
     floodFill(grid, *seed, options.maximumCells);
+    rejectUnboundedHorizontalFlood(grid);
     const std::size_t reachableCount = static_cast<std::size_t>(
         std::count(grid->reachable.begin(), grid->reachable.end(), 1));
     cropToReachableComponent(grid, 22.0);
@@ -1534,6 +1826,7 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
     result.cellSizeMm = options.cellSizeMm;
     result.usedTangentialEnvelopeFallback =
         boundaryMode && !grid->enforceTangentialIntersection;
+    result.usedLocalizedFallbackWindow = grid->localizedBoundaryWindow;
     result.sourceTopologyValid = model.topologyValid;
     return result;
 }

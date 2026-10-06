@@ -55,8 +55,9 @@ struct AssemblyPackingRegion {
     std::size_t boundarySolidCount{0};
     double cellSizeMm{0.0};
     // True when strict tangential-footprint intersection was empty and the
-    // extractor had to use the selected-face union envelope as a local window.
+    // extractor had to use a seed-localized selected-face envelope.
     bool usedTangentialEnvelopeFallback{false};
+    bool usedLocalizedFallbackWindow{false};
     bool sourceTopologyValid{true};
 };
 

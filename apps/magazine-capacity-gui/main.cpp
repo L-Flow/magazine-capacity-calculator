@@ -3,12 +3,14 @@
 #include <QApplication>
 #include <QFile>
 #include <QFileInfo>
+#include <QIcon>
 #include <QTextStream>
 #include <QTimer>
 
 int main(int argc, char** argv) {
     QApplication application(argc, argv);
     QApplication::setApplicationName(QStringLiteral("Magazine Capacity"));
+    application.setWindowIcon(QIcon(QStringLiteral(":/app-icon.ico")));
     const bool smokeTest = argc == 3 && QString::fromLocal8Bit(argv[1]) ==
                                       QStringLiteral("--smoke-test");
     MainWindow window(!smokeTest);

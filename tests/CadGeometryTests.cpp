@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <exception>
 #include <iostream>
 #include <vector>
 
@@ -91,6 +92,35 @@ TopoDS_Face faceAtPlane(const TopoDS_Shape& shape, char axis, double value) {
                   : std::abs(minZ - value) < 1.0e-4 &&
                         std::abs(maxZ - value) < 1.0e-4;
         if (matches) return face;
+    }
+    return {};
+}
+
+TopoDS_Face faceAtPlaneAndXRange(const TopoDS_Shape& shape, char axis,
+                                 double value, double minX, double maxX) {
+    for (TopExp_Explorer it(shape, TopAbs_FACE); it.More(); it.Next()) {
+        const TopoDS_Face face = TopoDS::Face(it.Current());
+        Bnd_Box bounds;
+        BRepBndLib::Add(face, bounds);
+        double faceMinX = 0.0;
+        double faceMinY = 0.0;
+        double faceMinZ = 0.0;
+        double faceMaxX = 0.0;
+        double faceMaxY = 0.0;
+        double faceMaxZ = 0.0;
+        bounds.Get(faceMinX, faceMinY, faceMinZ,
+                   faceMaxX, faceMaxY, faceMaxZ);
+        const bool matchesPlane = axis == 'z'
+            ? std::abs(faceMinZ - value) < 1.0e-4 &&
+                  std::abs(faceMaxZ - value) < 1.0e-4
+            : axis == 'x'
+                  ? std::abs(faceMinX - value) < 1.0e-4 &&
+                        std::abs(faceMaxX - value) < 1.0e-4
+                  : std::abs(faceMinY - value) < 1.0e-4 &&
+                        std::abs(faceMaxY - value) < 1.0e-4;
+        if (matchesPlane && faceMaxX >= minX && faceMinX <= maxX) {
+            return face;
+        }
     }
     return {};
 }
@@ -281,6 +311,118 @@ int main() {
     require(!openExtracted.region.containsSphere({20.0, 20.0, 39.0}, 3.0,
                                                   1.0e-5),
             "open cavity must reject a sphere protruding above its selected rim");
+
+    // Regression for the seed-localized fallback: two separated floor faces
+    // deliberately make the exact tangent intersection empty.  The explicit
+    // seed in the left pocket must prevent the right pocket from being
+    // admitted through the selected-face union envelope.
+    BRep_Builder splitBuilder;
+    TopoDS_Compound splitAssembly;
+    splitBuilder.MakeCompound(splitAssembly);
+    splitBuilder.Add(splitAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 0.0), 40.0, 40.0, 4.0).Shape());
+    splitBuilder.Add(splitAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 36.0), 40.0, 40.0, 4.0).Shape());
+    splitBuilder.Add(splitAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(100.0, 0.0, 0.0), 40.0, 40.0, 4.0).Shape());
+    splitBuilder.Add(splitAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(100.0, 0.0, 36.0), 40.0, 40.0, 4.0).Shape());
+    magazine::cad::CadImportResult splitModel;
+    splitModel.shape = splitAssembly;
+    splitModel.minX = 0.0;
+    splitModel.minY = 0.0;
+    splitModel.minZ = 0.0;
+    splitModel.maxX = 140.0;
+    splitModel.maxY = 40.0;
+    splitModel.maxZ = 40.0;
+    splitModel.solidCount = 4;
+    splitModel.shellCount = 4;
+    splitModel.faceCount = 24;
+    const TopoDS_Face leftFloor = faceAtPlaneAndXRange(
+        splitAssembly, 'z', 0.0, 0.0, 40.0);
+    const TopoDS_Face rightFloor = faceAtPlaneAndXRange(
+        splitAssembly, 'z', 0.0, 100.0, 140.0);
+    const TopoDS_Face leftRoof = faceAtPlaneAndXRange(
+        splitAssembly, 'z', 40.0, 0.0, 40.0);
+    const TopoDS_Face rightRoof = faceAtPlaneAndXRange(
+        splitAssembly, 'z', 40.0, 100.0, 140.0);
+    require(!leftFloor.IsNull() && !rightFloor.IsNull() &&
+                !leftRoof.IsNull() && !rightRoof.IsNull(),
+            "split-pocket regression must find both floor and roof faces");
+    magazine::cad::AssemblyExtractionOptions splitOptions = extraction;
+    splitOptions.seedPointSource = gp_Pnt(20.0, 20.0, 20.0);
+    splitOptions.entryPointSource = gp_Pnt(20.0, 20.0, 40.0);
+    const auto splitExtracted = magazine::cad::makeAssemblyPackingRegion(
+        splitModel, gp_Dir(0.0, 0.0, -1.0),
+        std::vector<TopoDS_Face>{leftFloor, rightFloor, leftRoof, rightRoof},
+        splitOptions);
+    require(splitExtracted.usedTangentialEnvelopeFallback &&
+                splitExtracted.usedLocalizedFallbackWindow,
+            "split pockets must exercise the localized fallback");
+    require(splitExtracted.region.containsSphere({20.0, 20.0, 20.0}, 3.0,
+                                                 1.0e-5),
+            "localized fallback must retain the seeded pocket");
+    require(splitExtracted.region.bounds.widthMm < 80.0,
+            "localized fallback must not retain the separated pocket envelope");
+
+    // Seven selected patches can all lie on the same inner side wall. Their
+    // normal-axis projection is empty, while the opposite, unselected wall is
+    // still a real solid. A finite selected-face AABB must not clip the
+    // reachable cavity into a 24 mm band alongside the selected wall.
+    BRep_Builder oneSideBuilder;
+    TopoDS_Compound oneSideAssembly;
+    oneSideBuilder.MakeCompound(oneSideAssembly);
+    std::vector<TopoDS_Face> oneSideFaces;
+    for (int part = 0; part < 7; ++part) {
+        const double minY = part * (100.0 / 7.0);
+        const double maxY = (part + 1) * (100.0 / 7.0);
+        const TopoDS_Shape wall = BRepPrimAPI_MakeBox(
+            gp_Pnt(0.0, minY, 0.0), 4.0, maxY - minY, 80.0).Shape();
+        oneSideBuilder.Add(oneSideAssembly, wall);
+        const TopoDS_Face innerFace = faceAtPlane(wall, 'x', 4.0);
+        require(!innerFace.IsNull(), "split wall must expose an inner face");
+        oneSideFaces.push_back(innerFace);
+    }
+    oneSideBuilder.Add(oneSideAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(136.0, 0.0, 0.0), 4.0, 100.0, 80.0).Shape());
+    oneSideBuilder.Add(oneSideAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 0.0), 140.0, 4.0, 80.0).Shape());
+    oneSideBuilder.Add(oneSideAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 96.0, 0.0), 140.0, 4.0, 80.0).Shape());
+    oneSideBuilder.Add(oneSideAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 0.0), 140.0, 100.0, 4.0).Shape());
+    const TopoDS_Shape shortFloor = BRepPrimAPI_MakeBox(
+        gp_Pnt(4.0, 0.0, 0.0), 16.0, 100.0, 4.0).Shape();
+    oneSideBuilder.Add(oneSideAssembly, shortFloor);
+    oneSideFaces.push_back(faceAtPlane(shortFloor, 'z', 4.0));
+    magazine::cad::CadImportResult oneSideModel;
+    oneSideModel.shape = oneSideAssembly;
+    oneSideModel.minX = 0.0;
+    oneSideModel.minY = 0.0;
+    oneSideModel.minZ = 0.0;
+    oneSideModel.maxX = 140.0;
+    oneSideModel.maxY = 100.0;
+    oneSideModel.maxZ = 80.0;
+    oneSideModel.solidCount = 12;
+    oneSideModel.shellCount = 12;
+    oneSideModel.faceCount = 72;
+    magazine::cad::AssemblyExtractionOptions oneSideOptions = extraction;
+    oneSideOptions.cellSizeMm = 8.0;
+    oneSideOptions.seedPointSource = gp_Pnt(12.0, 50.0, 40.0);
+    oneSideOptions.entryPointSource = gp_Pnt(12.0, 50.0, 80.0);
+    magazine::cad::AssemblyPackingRegion oneSideExtracted;
+    try {
+        oneSideExtracted = magazine::cad::makeAssemblyPackingRegion(
+            oneSideModel, gp_Dir(0.0, 0.0, -1.0), oneSideFaces,
+            oneSideOptions);
+    } catch (const std::exception& error) {
+        std::cerr << "one-sided extraction error: " << error.what() << '\n';
+        return 1;
+    }
+    require(oneSideExtracted.usedTangentialEnvelopeFallback,
+            "split one-sided wall must exercise the envelope fallback");
+    require(oneSideExtracted.region.bounds.widthMm > 100.0,
+            "one-sided selected wall must retain the opposite solid-bounded cavity");
 
     std::cout << "z-bounds=" << zAligned.region.bounds.widthMm << 'x'
               << zAligned.region.bounds.depthMm << 'x'

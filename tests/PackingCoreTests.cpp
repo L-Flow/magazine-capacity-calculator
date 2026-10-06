@@ -3,7 +3,9 @@
 #include "packing/Validation.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -48,6 +50,25 @@ int main() {
     require(settled.centers.size() <=
                 std::max(fcc.centers.size(), hcp.centers.size()) + 8,
             "settling should remain near the lattice reference for a box");
+
+    // A slow geometry callback must still produce a bounded, explicitly
+    // marked partial result for interactive callers.
+    PackingRegion slowRegion = boxPackingRegion(box);
+    slowRegion.verticalInterval = [box](double x, double y, double radius)
+        -> std::optional<VerticalInterval> {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (x < radius || x > box.widthMm - radius || y < radius ||
+            y > box.depthMm - radius) {
+            return std::nullopt;
+        }
+        return VerticalInterval{radius, box.heightMm - radius};
+    };
+    SettlingOptions timedOptions = options;
+    timedOptions.maximumRuntimeMilliseconds = 1;
+    const PackingResult timed = settleWithoutFriction(
+        slowRegion, radius, timedOptions);
+    require(timed.stoppedByTimeLimit,
+            "settling must report a hard runtime limit");
 
     std::cout << "FCC=" << fcc.centers.size()
               << " HCP=" << hcp.centers.size()

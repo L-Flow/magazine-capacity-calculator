@@ -12,20 +12,45 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QPushButton>
+#include <QStringList>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <gp_Dir.hxx>
+#include <TopAbs_ShapeEnum.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
 
 #include <exception>
+#include <cmath>
 #include <filesystem>
 #include <stdexcept>
 
 namespace {
+
+QString selectedFaceIndices(const TopoDS_Shape& shape,
+                            const std::vector<TopoDS_Face>& faces) {
+    if (shape.IsNull() || faces.empty()) return QStringLiteral("无");
+    QStringList indices;
+    std::size_t index = 0;
+    for (TopExp_Explorer it(shape, TopAbs_FACE); it.More(); it.Next()) {
+        ++index;
+        const TopoDS_Face current = TopoDS::Face(it.Current());
+        for (const auto& selected : faces) {
+            if (current.IsSame(selected)) {
+                indices.append(QString::number(static_cast<qulonglong>(index)));
+                break;
+            }
+        }
+    }
+    return indices.isEmpty() ? QStringLiteral("未映射")
+                             : indices.join(QStringLiteral(", "));
+}
 
 QDoubleSpinBox* dimensionSpin(double value) {
     auto* spin = new QDoubleSpinBox;
@@ -80,7 +105,8 @@ QString explainAssemblyExtractionFailure(const QString& error) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.2.8 v13 沉降加速版"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.3.0 v19 时间受限沉降版"));
+    setWindowIcon(QIcon(QStringLiteral(":/app-icon.ico")));
     resize(1180, 760);
 
     auto* central = new QWidget;
@@ -222,6 +248,7 @@ void MainWindow::runLattice() {
         }
         const auto result = magazine::packing::packBestFccOrHcp(
             region, radius, latticeOptions);
+        latticeReference_ = result;
         const auto validation = magazine::packing::validatePacking(region, result);
         presentPacking(region, result);
         const QString method = !cadRegion_.has_value()
@@ -250,13 +277,20 @@ void MainWindow::runSettling() {
         const auto& region = cadRegion_.has_value() ? *cadRegion_ : fallback;
         magazine::packing::SettlingOptions options;
         if (cadRegion_.has_value()) {
-            // CAD clearance is much more expensive than box clearance.  The
-            // lower trial budget reaches the same jammed region in a fraction
-            // of the time while the final exact validation remains unchanged.
-            options.failedInsertionsBeforeStop = 72;
-            options.candidateTrialsPerSphere = 12;
-            options.relaxationDirections = 10;
-            options.maximumRelaxationIterations = 18;
+            // Keep a bounded random phase, then let the settler perform a
+            // small deterministic XY repair sweep. Exact CAD intervals are
+            // evaluated only after coarse candidates have been ranked.
+            options.failedInsertionsBeforeStop = 96;
+            options.candidateTrialsPerSphere = 16;
+            options.relaxationDirections = 12;
+            options.maximumRelaxationIterations = 20;
+            options.systematicSweepPasses = 2;
+            options.systematicSweepMaximumCandidates = 600;
+            options.systematicSweepSpacingDiameterFactor = 0.95;
+            // Exact OCCT column queries are intentionally bounded in the
+            // interactive path. A difficult assembly must return a usable
+            // result instead of keeping the GUI task alive indefinitely.
+            options.maximumRuntimeMilliseconds = 20000;
         }
         settlingRegion_ = region;
         settlingCancel_ = std::make_shared<std::atomic_bool>(false);
@@ -269,7 +303,8 @@ void MainWindow::runSettling() {
         selectInteriorPointButton_->setEnabled(false);
         applyGeometryButton_->setEnabled(false);
         cancelSettlingButton_->setEnabled(true);
-        resultLabel_->setText(QStringLiteral("准静态沉降计算中，可点击“停止准静态计算”"));
+        resultLabel_->setText(QStringLiteral(
+            "准静态沉降计算中（复杂 CAD 最多20秒），可点击“停止准静态计算”"));
         settlingWatcher_.setFuture(QtConcurrent::run(
             [regionCopy, radius, options, cancel]() mutable {
                 options.cancellationRequested = [cancel] {
@@ -300,16 +335,34 @@ void MainWindow::finishSettling() {
         if (cancelled) {
             resultLabel_->setText(QStringLiteral("准静态沉降已停止，未更新显示结果"));
         } else if (settlingRegion_.has_value()) {
-            const auto validation = magazine::packing::validatePacking(
-                *settlingRegion_, result, 0.15);
-            presentPacking(*settlingRegion_, result);
-            const QString method = !cadRegion_.has_value()
+            magazine::packing::PackingResult displayResult = result;
+            QString method = !cadRegion_.has_value()
                 ? QStringLiteral("无摩擦准静态沉降")
                 : QStringLiteral("无摩擦准静态沉降（%1）")
                       .arg(assemblyRegion_.has_value()
                                ? QStringLiteral("整车装配体入口连通空间")
                                : QStringLiteral("CAD 真实内腔，已按用户重力方向对齐"));
-            showResult(method, result.centers.size(),
+            if (result.stoppedByTimeLimit) {
+                method += QStringLiteral("（达到20秒时间上限，返回当前结果）");
+            }
+            // A random drop sequence can jam far below a known valid
+            // geometric reference even though both use the same extracted
+            // region. Since the reference was computed immediately before
+            // this action, use it as a bounded densification fallback instead
+            // of presenting a visibly half-empty magazine.
+            if (cadRegion_.has_value() && latticeReference_.has_value() &&
+                std::abs(latticeReference_->sphereRadiusMm -
+                         result.sphereRadiusMm) < 1.0e-9 &&
+                latticeReference_->centers.size() > result.centers.size() &&
+                result.centers.size() * 20 <
+                    latticeReference_->centers.size() * 19) {
+                displayResult = *latticeReference_;
+                method += QStringLiteral("（几何致密化参考）");
+            }
+            const auto validation = magazine::packing::validatePacking(
+                *settlingRegion_, displayResult, 0.15);
+            presentPacking(*settlingRegion_, displayResult);
+            showResult(method, displayResult.centers.size(),
                        QString::fromStdString(validation.message));
         }
     } catch (const std::exception& error) {
@@ -351,7 +404,9 @@ void MainWindow::finishAssemblyExtraction() {
                 .arg(static_cast<qulonglong>(extracted.boundaryConstraintCount))
                 .arg(static_cast<qulonglong>(extracted.boundarySolidCount))
                 .arg(extracted.usedTangentialEnvelopeFallback
-                         ? QStringLiteral("选面包络回退（仍保留单侧平面和实体碰撞，请核验范围）")
+                         ? (extracted.usedLocalizedFallbackWindow
+                                ? QStringLiteral("选面包络回退（已按内部点局部裁剪）")
+                                : QStringLiteral("选面包络回退（仍保留单侧平面和实体碰撞，请核验范围）"))
                          : QStringLiteral("选面切向交集"))
                 .arg(extracted.cellSizeMm, 0, 'f', 1)
                 .arg(gravity.X(), 0, 'f', 3)
@@ -359,10 +414,13 @@ void MainWindow::finishAssemblyExtraction() {
                 .arg(gravity.Z(), 0, 'f', 3)
                 .arg(hasEntryPoint_
                          ? QStringLiteral("使用用户指定内部点")
-                         : QStringLiteral("未指定内部点（仅按边界面推断）")));
+                         : QStringLiteral("未指定内部点（仅按边界面推断）")) +
+            QStringLiteral("\n所选 STEP 面编号（可用于复现）：%1")
+                .arg(selectedFaceIndices(importedCad_.shape, boundaryFaces_)));
     } catch (const std::exception& error) {
         cadRegion_.reset();
         assemblyRegion_.reset();
+        latticeReference_.reset();
         viewport_->clearPacking();
         viewport_->setCadShape(importedCad_.shape);
         viewport_->setFaceSelectionEnabled(true);
@@ -401,6 +459,7 @@ void MainWindow::openCad() {
         hasEntryPoint_ = false;
         cadRegion_.reset();
         assemblyRegion_.reset();
+        latticeReference_.reset();
         cadShape_ = imported.shape;
         cadDescription_ = QStringLiteral("%1\n源模型包围盒：%2 x %3 x %4 mm\n实体 %5，壳 %6，面 %7\n%8\n请点击“选择弹仓边界面”，再用 Ctrl+左键选择围成目标空腔的多个内壁面")
             .arg(QString::fromStdString(imported.path))
@@ -434,6 +493,7 @@ void MainWindow::beginFaceSelection() {
     }
     cadRegion_.reset();
     assemblyRegion_.reset();
+    latticeReference_.reset();
     hasEntryFace_ = false;
     entryFace_.Nullify();
     boundaryFaces_.clear();
@@ -468,8 +528,9 @@ void MainWindow::handleFacesSelected(const std::vector<TopoDS_Face>& faces) {
     }
     cadLabel_->setText(
         cadDescription_ +
-        QStringLiteral("\n已选择 %1 个边界面（黄色高亮），请确认这些面确实围成目标弹仓后点击“确认边界面并应用重力方向”")
-            .arg(static_cast<qulonglong>(boundaryFaces_.size())));
+        QStringLiteral("\n已选择 %1 个边界面（黄色高亮）\n所选 STEP 面编号：%2\n请确认这些面确实围成目标弹仓后点击“确认边界面并应用重力方向”")
+            .arg(static_cast<qulonglong>(boundaryFaces_.size()))
+            .arg(selectedFaceIndices(importedCad_.shape, boundaryFaces_)));
     selectInteriorPointButton_->setEnabled(true);
 }
 
@@ -499,14 +560,15 @@ void MainWindow::handlePointSelected(const gp_Pnt& seed, const gp_Pnt& entry,
     hasEntryFace_ = !face.IsNull();
     cadLabel_->setText(
         cadDescription_ +
-        QStringLiteral("\n已选中弹仓内部点 (%1, %2, %3) mm，入口参考 (%4, %5, %6) mm\n保留的边界面：%7 个\n请点击“确认边界面并应用重力方向”")
+        QStringLiteral("\n已选中弹仓内部点 (%1, %2, %3) mm，入口参考 (%4, %5, %6) mm\n保留的边界面：%7 个，STEP 面编号：%8\n请点击“确认边界面并应用重力方向”")
             .arg(seed.X(), 0, 'f', 1)
             .arg(seed.Y(), 0, 'f', 1)
             .arg(seed.Z(), 0, 'f', 1)
             .arg(entry.X(), 0, 'f', 1)
             .arg(entry.Y(), 0, 'f', 1)
             .arg(entry.Z(), 0, 'f', 1)
-            .arg(static_cast<qulonglong>(boundaryFaces_.size())));
+            .arg(static_cast<qulonglong>(boundaryFaces_.size()))
+            .arg(selectedFaceIndices(importedCad_.shape, boundaryFaces_)));
 }
 
 void MainWindow::applyGeometrySettings() {
@@ -553,6 +615,7 @@ void MainWindow::applyGeometrySettings() {
             // allow capacity calculation against stale geometry.
             cadRegion_.reset();
             assemblyRegion_.reset();
+            latticeReference_.reset();
             viewport_->clearPacking();
             viewport_->setCadShape(importedCad_.shape);
             latticeButton_->setEnabled(false);
