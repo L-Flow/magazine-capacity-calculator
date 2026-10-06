@@ -105,7 +105,7 @@ QString explainAssemblyExtractionFailure(const QString& error) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.3.1 v22 填充优化版"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.3.1 v23 沉降填充优化版"));
     setWindowIcon(QIcon(QStringLiteral(":/app-icon.ico")));
     resize(1180, 760);
 

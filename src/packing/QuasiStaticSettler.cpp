@@ -46,6 +46,13 @@ class SupportIndex {
 public:
     explicit SupportIndex(double cellSize) : cellSize_(cellSize) {}
 
+    void rebuild(const std::vector<Vec3>& centers) {
+        cells_.clear();
+        for (std::size_t index = 0; index < centers.size(); ++index) {
+            insert(centers[index], index);
+        }
+    }
+
     void insert(const Vec3& center, std::size_t index) {
         cells_[cellFor(center.x, center.y)].push_back(index);
     }
@@ -435,20 +442,27 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
         }
         if (structuredCenters.size() > centers.size()) {
             centers = std::move(structuredCenters);
+            // The support index stores center indices.  Rebuild it whenever
+            // a complete candidate packing replaces the current one; keeping
+            // the old index would query support heights from stale centers.
+            supportIndex.rebuild(centers);
         }
     }
 
-    // Repair local voids left by the random phase.  A sphere that rests on
+    // Repair local voids left by a candidate packing.  A sphere that rests on
     // two nearby spheres has one of two horizontal circle-intersection
     // positions; testing those positions finds the triangular holes that a
     // rectangular sweep cannot see.  Rebuild the pair candidates after each
-    // round because every accepted sphere creates new support pairs.
-    if (!shouldStop() && centers.size() >= 2) {
+    // round because every accepted sphere creates new support pairs.  Keep
+    // this as a callable pass so a later deterministic packing receives the
+    // same local-hole repair as the random packing.
+    const auto repairPairVoids = [&](std::size_t maximumRounds) {
+        if (centers.size() < 2) return;
         const double diameter = 2.0 * radius;
         const double diameterSquared = diameter * diameter;
         const std::size_t pairCandidateLimit = std::max<std::size_t>(
             options.systematicSweepMaximumCandidates * 4, 256);
-        for (std::size_t round = 0; round < options.systematicSweepPasses &&
+        for (std::size_t round = 0; round < maximumRounds &&
                                     !shouldStop();
              ++round) {
             std::vector<Vec3> pairCandidates;
@@ -511,7 +525,9 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
             }
             if (!insertedInRound) break;
         }
-    }
+    };
+
+    repairPairVoids(options.systematicSweepPasses);
 
     // Use the close-packed horizontal phases as search proposals for a
     // fresh gravity build.  The lattice itself is never copied into the
@@ -521,27 +537,90 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
     // quasi-static settling semantics.
     bool usedDeterministicCompaction = false;
     if (!shouldStop()) {
-        LatticeOptions guideOptions;
-        guideOptions.phaseDivisions = 2;
-        const PackingResult guide = packHcp(region, radius, guideOptions);
-        std::vector<Vec3> compactedCenters;
-        compactedCenters.reserve(guide.centers.size());
-        SupportIndex compactedSupport(2.0 * radius);
-        for (const Vec3& proposal : guide.centers) {
-            if (shouldStop()) break;
-            const Vec3 candidate = restingPosition(
-                proposal.x, proposal.y, region, compactedCenters,
-                compactedSupport, radius, true, deadline);
-            if (!std::isfinite(candidate.z) ||
-                !region.containsSphere(candidate, radius, 1.0e-5)) {
-                continue;
+        const auto compactGuide = [&](const PackingResult& guide) {
+            std::vector<Vec3> compactedCenters;
+            compactedCenters.reserve(guide.centers.size());
+            SupportIndex compactedSupport(2.0 * radius);
+            for (const Vec3& proposal : guide.centers) {
+                if (shouldStop()) break;
+                const Vec3 candidate = restingPosition(
+                    proposal.x, proposal.y, region, compactedCenters,
+                    compactedSupport, radius, true, deadline);
+                if (!std::isfinite(candidate.z) ||
+                    !region.containsSphere(candidate, radius, 1.0e-5)) {
+                    continue;
+                }
+                compactedCenters.push_back(candidate);
+                compactedSupport.insert(candidate,
+                                         compactedCenters.size() - 1);
             }
-            compactedCenters.push_back(candidate);
-            compactedSupport.insert(candidate, compactedCenters.size() - 1);
-        }
+            return compactedCenters;
+        };
+
+        LatticeOptions hcpOptions;
+        // Three phase offsets give the guided build enough freedom to align
+        // the close-packed rows with stepped walls while remaining bounded
+        // for the interactive CAD time budget.
+        hcpOptions.phaseDivisions = 3;
+        const PackingResult hcpGuide =
+            packHcp(region, radius, hcpOptions);
+        std::vector<Vec3> compactedCenters = compactGuide(hcpGuide);
         if (compactedCenters.size() > centers.size()) {
             centers = std::move(compactedCenters);
+            // The deterministic candidate packing has its own support index;
+            // make the main index agree before any later repair pass.
+            supportIndex.rebuild(centers);
             usedDeterministicCompaction = true;
+        }
+    }
+
+    // HCP-guided compaction fills the large-scale layers first.  Run a short
+    // contact repair afterwards as well: the rebuilt packing can expose
+    // triangular interstices that were absent from the random candidate.
+    if (!shouldStop()) repairPairVoids(std::min<std::size_t>(
+        options.systematicSweepPasses, 3));
+
+    // A close-packed guide has a fixed horizontal phase.  A short finer
+    // sweep after compaction checks the interstices around CAD steps and
+    // rounded obstacles that do not coincide with that phase.  Candidates
+    // are still lowered against the current support index and accepted only
+    // after the exact region predicate, so this cannot create an out-of-wall
+    // sphere or an overlap.
+    if (!shouldStop()) {
+        const double fineSpacing = std::max(
+            2.0 * radius * 0.60, 2.0 * options.minimumLateralStepMm);
+        const std::size_t fineCandidateLimit = std::min<std::size_t>(
+            options.systematicSweepMaximumCandidates, 5000);
+        for (std::size_t pass = 0; pass < 2 && !shouldStop(); ++pass) {
+            const double offset = (pass == 0) ? 0.0 : 0.5 * fineSpacing;
+            bool insertedInPass = false;
+            std::size_t tested = 0;
+            for (double x = radius + offset;
+                 x <= region.bounds.widthMm - radius &&
+                 tested < fineCandidateLimit && !shouldStop();
+                 x += fineSpacing) {
+                for (double y = radius + offset;
+                     y <= region.bounds.depthMm - radius &&
+                     tested < fineCandidateLimit && !shouldStop();
+                     y += fineSpacing) {
+                    ++tested;
+                    const Vec3 coarseCandidate = restingPosition(
+                        x, y, region, centers, supportIndex, radius, false,
+                        deadline);
+                    if (!std::isfinite(coarseCandidate.z)) continue;
+                    const Vec3 candidate = restingPosition(
+                        x, y, region, centers, supportIndex, radius, true,
+                        deadline);
+                    if (!std::isfinite(candidate.z) ||
+                        !region.containsSphere(candidate, radius, 1.0e-5)) {
+                        continue;
+                    }
+                    centers.push_back(candidate);
+                    supportIndex.insert(candidate, centers.size() - 1);
+                    insertedInPass = true;
+                }
+            }
+            if (!insertedInPass) break;
         }
     }
 
