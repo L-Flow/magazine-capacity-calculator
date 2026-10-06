@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
@@ -180,7 +181,12 @@ void ensureObstacleMesh(Obstacle& obstacle) {
             TopLoc_Location location;
             const Handle(Poly_Triangulation) triangulation =
                 BRep_Tool::Triangulation(face, location);
-            if (triangulation.IsNull()) continue;
+            if (triangulation.IsNull() || triangulation->NbTriangles() == 0) {
+                // A partial surface cannot certify sphere clearance. Retain
+                // the conservative OCCT fallback for the whole solid.
+                obstacle.triangles.clear();
+                return;
+            }
             for (int index = 1; index <= triangulation->NbTriangles();
                  ++index) {
                 int nodeA = 0;
@@ -436,6 +442,8 @@ struct AssemblyGrid {
 
     void rebuildObstacleIndex() {
         obstacleCandidates.clear();
+        sphereQueryMarks.assign(obstacles.size(), 0);
+        sphereQueryGeneration = 0;
         if (nx <= 0 || ny <= 0 || nz <= 0 || obstacles.empty()) return;
         obstacleCandidates.resize(
             static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
@@ -513,8 +521,7 @@ struct AssemblyGrid {
         if (!sphereOnMagazineSide(centerPoint, radius) ||
             !withinAperture(centerPoint, radius) ||
             !withinBoundaryBox(centerPoint, radius) ||
-            !insideBoundaryEnvelope(centerPoint) ||
-            pointInsideObstacle(centerPoint)) {
+            !insideBoundaryEnvelope(centerPoint)) {
             return false;
         }
         const int cx = static_cast<int>(std::floor(localCenter.x / cellSize));
@@ -524,8 +531,16 @@ struct AssemblyGrid {
             return false;
         }
 
-        for (const Obstacle& obstacle : obstacles) {
-            const double clearance = radius + tolerance;
+        const double clearance = radius + tolerance;
+        const double clearanceSquared = clearance * clearance;
+        // Flood fill classifies every reachable cell center as free space.
+        // If that known-free point lies within the sphere and no surface
+        // intersects it, the sphere cannot be wholly inside any solid.
+        // Reserve the meshing deflection as a margin. Smaller spheres or
+        // coarser grids still need the exact OCCT center classification.
+        const bool containsKnownFreePoint =
+            centerPoint.Distance(center(cx, cy, cz)) + 0.5 < radius;
+        auto testObstacle = [&](const Obstacle& obstacle) {
             const double dx = std::max({obstacle.minX - centerPoint.X(),
                                         0.0,
                                         centerPoint.X() - obstacle.maxX});
@@ -535,35 +550,95 @@ struct AssemblyGrid {
             const double dz = std::max({obstacle.minZ - centerPoint.Z(),
                                         0.0,
                                         centerPoint.Z() - obstacle.maxZ});
-            if (dx * dx + dy * dy + dz * dz > clearance * clearance) {
-                continue;
+            if (dx * dx + dy * dy + dz * dz > clearanceSquared) {
+                return false;
             }
             try {
                 ensureObstacleMesh(const_cast<Obstacle&>(obstacle));
                 if (!obstacle.triangles.empty()) {
-                    const double clearanceSquared = clearance * clearance;
                     for (const Triangle& triangle : obstacle.triangles) {
                         if (pointTriangleDistanceSquared(centerPoint, triangle) <=
                             clearanceSquared) {
-                            return false;
+                            return true;
                         }
                     }
-                } else {
-                    // Keep a conservative OCCT fallback for malformed parts
-                    // that cannot be triangulated.
-                    const TopoDS_Shape sphere =
-                        BRepPrimAPI_MakeSphere(centerPoint, radius).Shape();
-                    BRepExtrema_DistShapeShape distance(sphere, obstacle.shape);
-                    if (!distance.IsDone() || distance.Value() <= tolerance) {
-                        return false;
+                    if (containsKnownFreePoint) return false;
+                }
+                if (dx == 0.0 && dy == 0.0 && dz == 0.0) {
+                    if (!obstacle.classifier) {
+                        obstacle.classifier =
+                            std::make_shared<BRepClass3d_SolidClassifier>(
+                                TopoDS::Solid(obstacle.shape));
+                    }
+                    obstacle.classifier->Perform(centerPoint,
+                                                 Precision::Confusion());
+                    const TopAbs_State state = obstacle.classifier->State();
+                    if (state == TopAbs_IN || state == TopAbs_ON) return true;
+                }
+                if (!obstacle.triangles.empty()) return false;
+                // Keep the OCCT distance fallback for parts that cannot be
+                // fully triangulated. Any OCCT failure rejects the sphere.
+                const TopoDS_Shape sphere =
+                    BRepPrimAPI_MakeSphere(centerPoint, radius).Shape();
+                BRepExtrema_DistShapeShape distance(sphere, obstacle.shape);
+                return !distance.IsDone() || distance.Value() <= tolerance;
+            } catch (const Standard_Failure&) {
+                return true;
+            }
+        };
+
+        // Reuse the voxel broad phase for sphere checks.  The neighborhood is
+        // expanded by the projectile radius, while the exact triangle/OCCT
+        // test above remains the final authoritative collision predicate.
+        if (!obstacleCandidates.empty() && inBounds(cx, cy, cz)) {
+            if (sphereQueryMarks.size() != obstacles.size()) {
+                sphereQueryMarks.assign(obstacles.size(), 0);
+                sphereQueryGeneration = 0;
+            }
+            ++sphereQueryGeneration;
+            if (sphereQueryGeneration == 0) {
+                std::fill(sphereQueryMarks.begin(), sphereQueryMarks.end(), 0);
+                sphereQueryGeneration = 1;
+            }
+            const int cellRadius = std::max(
+                1, static_cast<int>(std::ceil(
+                    (clearance + obstacleInflation) / cellSize)));
+            const int minX = std::max(0, cx - cellRadius);
+            const int maxX = std::min(nx - 1, cx + cellRadius);
+            const int minY = std::max(0, cy - cellRadius);
+            const int maxY = std::min(ny - 1, cy + cellRadius);
+            const int minZ = std::max(0, cz - cellRadius);
+            const int maxZ = std::min(nz - 1, cz + cellRadius);
+            for (int z = minZ; z <= maxZ; ++z) {
+                for (int y = minY; y <= maxY; ++y) {
+                    for (int x = minX; x <= maxX; ++x) {
+                        for (const std::size_t obstacleIndex :
+                             obstacleCandidates[index(x, y, z)]) {
+                            if (obstacleIndex >= obstacles.size() ||
+                                sphereQueryMarks[obstacleIndex] ==
+                                    sphereQueryGeneration) {
+                                continue;
+                            }
+                            sphereQueryMarks[obstacleIndex] =
+                                sphereQueryGeneration;
+                            if (testObstacle(obstacles[obstacleIndex])) {
+                                return false;
+                            }
+                        }
                     }
                 }
-            } catch (const Standard_Failure&) {
-                return false;
             }
+            return true;
+        }
+
+        for (const Obstacle& obstacle : obstacles) {
+            if (testObstacle(obstacle)) return false;
         }
         return true;
     }
+
+    mutable std::vector<std::uint32_t> sphereQueryMarks;
+    mutable std::uint32_t sphereQueryGeneration{0};
 };
 
 gp_Dir faceNormal(const TopoDS_Face& face, const gp_Dir& fallback) {

@@ -1,6 +1,7 @@
 #include "cad/CadPackingRegion.hpp"
 #include "cad/AssemblyPackingRegion.hpp"
 #include "packing/LatticePacking.hpp"
+#include "packing/QuasiStaticSettler.hpp"
 #include "packing/Validation.hpp"
 
 #include <BRepPrimAPI_MakeBox.hxx>
@@ -193,6 +194,53 @@ int main() {
     // local Z origin is the original cavity floor at 4 mm.
     require(!extracted.region.containsSphere({20.0, 20.0, 1.0}, 3.0, 1.0e-5),
             "assembly floor must reject a penetrating sphere");
+
+    // A 4 mm connectivity cell can contain a solid between its samples.
+    // Surface distance alone would accept a small sphere wholly inside this
+    // insert; exact point classification must still reject it after indexing.
+    TopoDS_Compound insertAssembly;
+    builder.MakeCompound(insertAssembly);
+    builder.Add(insertAssembly, assembly);
+    builder.Add(insertAssembly, BRepPrimAPI_MakeBox(
+        gp_Pnt(8.1, 8.1, 16.1), 1.8, 1.8, 7.8).Shape());
+    auto insertModel = assemblyModel;
+    insertModel.shape = insertAssembly;
+    insertModel.solidCount = 7;
+    insertModel.shellCount = 7;
+    insertModel.faceCount = 42;
+    auto insertOptions = extraction;
+    insertOptions.seedPointSource = gp_Pnt(20.0, 20.0, 20.0);
+    insertOptions.entryPointSource = gp_Pnt(20.0, 20.0, 36.0);
+    const auto withInsert = magazine::cad::makeAssemblyPackingRegion(
+        insertModel, gp_Dir(0.0, 0.0, -1.0), assemblyEntry, insertOptions);
+    // Cropping translates source (4,4,4) to local (0,0,0), so the insert
+    // center (9,9,20) becomes (5,5,16). Its cell center is source (10,10,22),
+    // outside the insert, demonstrating why reachability alone is insufficient.
+    require(withInsert.region.containsSphere({6.5, 6.5, 16.0}, 0.2, 1.0e-5),
+            "nearby free space in the insert voxel must remain usable");
+    require(!withInsert.region.containsSphere({5.0, 5.0, 16.0}, 0.2, 1.0e-5),
+            "sphere wholly inside a solid in a reachable voxel must be rejected");
+    require(!withInsert.region.containsSphere({6.0, 5.0, 16.0}, 1.2, 1.0e-5),
+            "sphere center outside an insert must still reject wall penetration");
+    const auto insertPacked = packBestFccOrHcp(withInsert.region, 3.0, {2});
+    const auto insertValidation = validatePacking(withInsert.region, insertPacked);
+    require(!insertPacked.centers.empty() && insertValidation.allInside &&
+                insertValidation.noOverlap,
+            "indexed assembly lattice must remain inside and non-overlapping");
+    SettlingOptions insertSettlingOptions;
+    insertSettlingOptions.failedInsertionsBeforeStop = 12;
+    insertSettlingOptions.candidateTrialsPerSphere = 4;
+    insertSettlingOptions.systematicSweepPasses = 1;
+    insertSettlingOptions.systematicSweepMaximumCandidates = 40;
+    insertSettlingOptions.maximumRuntimeMilliseconds = 20000;
+    const auto insertSettled = settleWithoutFriction(
+        withInsert.region, 3.0, insertSettlingOptions);
+    const auto settlingValidation = validatePacking(
+        withInsert.region, insertSettled, 0.15);
+    require(!insertSettled.stoppedByTimeLimit &&
+                !insertSettled.centers.empty() && settlingValidation.allInside &&
+                settlingValidation.noOverlap,
+            "indexed assembly settling must finish with valid spheres");
 
     magazine::cad::AssemblyExtractionOptions pointExtraction = extraction;
     pointExtraction.entryPointSource = gp_Pnt(20.0, 20.0, 36.0);

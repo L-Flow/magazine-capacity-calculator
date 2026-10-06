@@ -44,6 +44,31 @@ std::vector<TopoDS_Face> facesAt(const TopoDS_Shape& shape,
     return faces;
 }
 
+void runAssemblySettling(const magazine::packing::PackingRegion& region,
+                         double radius) {
+    magazine::packing::SettlingOptions options;
+    options.failedInsertionsBeforeStop = 32;
+    options.candidateTrialsPerSphere = 8;
+    options.relaxationDirections = 8;
+    options.maximumRelaxationIterations = 12;
+    options.systematicSweepPasses = 1;
+    options.systematicSweepMaximumCandidates = 300;
+    options.systematicSweepSpacingDiameterFactor = 0.95;
+    options.maximumRuntimeMilliseconds = 20000;
+    const auto start = std::chrono::steady_clock::now();
+    const auto settled = magazine::packing::settleWithoutFriction(
+        region, radius, options);
+    const auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    const auto check = magazine::packing::validatePacking(region, settled, 0.15);
+    std::cout << "settled: " << settled.centers.size() << ", "
+              << check.message << ", elapsed-s: " << elapsed
+              << (settled.stoppedByTimeLimit
+                      ? ", stopped-by-time-limit=yes"
+                      : ", stopped-by-time-limit=no")
+              << '\n';
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -56,7 +81,7 @@ int wmain(int argc, wchar_t** argv) {
                       L"<face-index,face-index,...> <gx> <gy> <gz> "
                       L"<seed-x> <seed-y> <seed-z> "
                       L"<entry-x> <entry-y> <entry-z> [diameter-mm] [cell-mm] "
-                      L"[--extract-only]\n";
+                      L"[--extract-only|--settle]\n";
         return EXIT_FAILURE;
     }
     try {
@@ -82,7 +107,9 @@ int wmain(int argc, wchar_t** argv) {
             if (argc >= 15) extraction.cellSizeMm = std::stod(argv[14]);
             const bool extractOnly = argc == 16 &&
                                      std::wstring(argv[15]) == L"--extract-only";
-            if (argc == 16 && !extractOnly) {
+            const bool settleMode = argc == 16 &&
+                                    std::wstring(argv[15]) == L"--settle";
+            if (argc == 16 && !extractOnly && !settleMode) {
                 throw std::invalid_argument("unknown assembly-faces option");
             }
             const auto assembly = magazine::cad::makeAssemblyPackingRegion(
@@ -94,9 +121,13 @@ int wmain(int argc, wchar_t** argv) {
                       << "selected-faces: " << assembly.selectedBoundaryFaceCount << '\n'
                       << "solver-bounds-mm: " << assembly.region.bounds.widthMm
                       << " x " << assembly.region.bounds.depthMm << " x "
-                      << assembly.region.bounds.heightMm << '\n';
+                      << assembly.region.bounds.heightMm << '\n' << std::flush;
             if (extractOnly) return EXIT_SUCCESS;
             const double radius = diameter / 2.0;
+            if (settleMode) {
+                runAssemblySettling(assembly.region, radius);
+                return EXIT_SUCCESS;
+            }
             magazine::packing::LatticeOptions latticeOptions;
             latticeOptions.phaseDivisions = 2;
             const auto lattice = magazine::packing::packBestFccOrHcp(
@@ -143,29 +174,7 @@ int wmain(int argc, wchar_t** argv) {
             if (extractOnly) return EXIT_SUCCESS;
             const double radius = diameter / 2.0;
             if (settleMode) {
-                magazine::packing::SettlingOptions options;
-                options.failedInsertionsBeforeStop = 96;
-                options.candidateTrialsPerSphere = 16;
-                options.relaxationDirections = 12;
-                options.maximumRelaxationIterations = 20;
-                options.systematicSweepPasses = 2;
-                options.systematicSweepMaximumCandidates = 600;
-                options.systematicSweepSpacingDiameterFactor = 0.95;
-                options.maximumRuntimeMilliseconds = 20000;
-                const auto start = std::chrono::steady_clock::now();
-                const auto settled = magazine::packing::settleWithoutFriction(
-                    assembly.region, radius, options);
-                const auto elapsed = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - start).count();
-                const auto settledCheck = magazine::packing::validatePacking(
-                    assembly.region, settled, 0.15);
-                std::cout << "settled: " << settled.centers.size() << ", "
-                          << settledCheck.message << ", elapsed-s: "
-                          << elapsed
-                          << (settled.stoppedByTimeLimit
-                                  ? ", stopped-by-time-limit=yes"
-                                  : ", stopped-by-time-limit=no")
-                          << '\n';
+                runAssemblySettling(assembly.region, radius);
             } else {
                 magazine::packing::LatticeOptions latticeOptions;
                 latticeOptions.phaseDivisions = 2;
@@ -196,10 +205,12 @@ int wmain(int argc, wchar_t** argv) {
                   << lattice.method << "), " << latticeCheck.message << '\n';
 
         magazine::packing::SettlingOptions options;
-        options.failedInsertionsBeforeStop = 96;
-        options.candidateTrialsPerSphere = 16;
-        options.systematicSweepPasses = 2;
-        options.systematicSweepMaximumCandidates = 600;
+        options.failedInsertionsBeforeStop = 32;
+        options.candidateTrialsPerSphere = 8;
+        options.relaxationDirections = 8;
+        options.maximumRelaxationIterations = 12;
+        options.systematicSweepPasses = 1;
+        options.systematicSweepMaximumCandidates = 300;
         options.systematicSweepSpacingDiameterFactor = 0.95;
         options.maximumRuntimeMilliseconds = 20000;
         const auto settled = magazine::packing::settleWithoutFriction(
