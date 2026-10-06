@@ -335,7 +335,6 @@ void MainWindow::finishSettling() {
         if (cancelled) {
             resultLabel_->setText(QStringLiteral("准静态沉降已停止，未更新显示结果"));
         } else if (settlingRegion_.has_value()) {
-            magazine::packing::PackingResult displayResult = result;
             QString method = !cadRegion_.has_value()
                 ? QStringLiteral("无摩擦准静态沉降")
                 : QStringLiteral("无摩擦准静态沉降（%1）")
@@ -345,24 +344,19 @@ void MainWindow::finishSettling() {
             if (result.stoppedByTimeLimit) {
                 method += QStringLiteral("（达到20秒时间上限，返回当前结果）");
             }
-            // A random drop sequence can jam far below a known valid
-            // geometric reference even though both use the same extracted
-            // region. Since the reference was computed immediately before
-            // this action, use it as a bounded densification fallback instead
-            // of presenting a visibly half-empty magazine.
-            if (cadRegion_.has_value() && latticeReference_.has_value() &&
+            if (latticeReference_.has_value() &&
                 std::abs(latticeReference_->sphereRadiusMm -
-                         result.sphereRadiusMm) < 1.0e-9 &&
-                latticeReference_->centers.size() > result.centers.size() &&
-                result.centers.size() * 20 <
-                    latticeReference_->centers.size() * 19) {
-                displayResult = *latticeReference_;
-                method += QStringLiteral("（几何致密化参考）");
+                         result.sphereRadiusMm) < 1.0e-9) {
+                method += QStringLiteral("\n%1 几何参考：%2 发")
+                              .arg(QString::fromStdString(
+                                  latticeReference_->method))
+                              .arg(static_cast<qulonglong>(
+                                  latticeReference_->centers.size()));
             }
             const auto validation = magazine::packing::validatePacking(
-                *settlingRegion_, displayResult, 0.15);
-            presentPacking(*settlingRegion_, displayResult);
-            showResult(method, displayResult.centers.size(),
+                *settlingRegion_, result, 0.15);
+            presentPacking(*settlingRegion_, result);
+            showResult(method, result.centers.size(),
                        QString::fromStdString(validation.message));
         }
     } catch (const std::exception& error) {
