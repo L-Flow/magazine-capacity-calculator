@@ -1,4 +1,5 @@
 #include "packing/QuasiStaticSettler.hpp"
+#include "packing/LatticePacking.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -312,30 +313,44 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
             batch.reserve(std::max<std::size_t>(8,
                                                 options.candidateTrialsPerSphere));
             auto flushBatch = [&]() {
-                if (batch.empty()) return false;
-                std::sort(batch.begin(), batch.end(),
-                          [](const Vec3& lhs, const Vec3& rhs) {
-                              if (lhs.z != rhs.z) return lhs.z < rhs.z;
-                              if (lhs.y != rhs.y) return lhs.y < rhs.y;
-                              return lhs.x < rhs.x;
-                          });
-                for (const Vec3& coarseCandidate : batch) {
-                    if (shouldStop()) return false;
-                    const Vec3 candidate = restingPosition(
-                        coarseCandidate.x, coarseCandidate.y, region, centers,
-                        supportIndex, radius, true, deadline);
-                    if (!std::isfinite(candidate.z) ||
-                        !region.containsSphere(candidate, radius, 1.0e-5)) {
-                        continue;
+                bool insertedAny = false;
+                while (!batch.empty() && !shouldStop()) {
+                    std::sort(batch.begin(), batch.end(),
+                              [](const Vec3& lhs, const Vec3& rhs) {
+                                  if (lhs.z != rhs.z) return lhs.z < rhs.z;
+                                  if (lhs.y != rhs.y) return lhs.y < rhs.y;
+                                  return lhs.x < rhs.x;
+                              });
+                    bool inserted = false;
+                    for (std::size_t index = 0; index < batch.size();
+                         ++index) {
+                        if (shouldStop()) break;
+                        const Vec3 coarseCandidate = batch[index];
+                        const Vec3 candidate = restingPosition(
+                            coarseCandidate.x, coarseCandidate.y, region,
+                            centers, supportIndex, radius, true, deadline);
+                        if (!std::isfinite(candidate.z) ||
+                            !region.containsSphere(candidate, radius, 1.0e-5)) {
+                            // This candidate is not usable with the current
+                            // packing. Do not retry it in this batch.
+                            batch.erase(batch.begin() +
+                                        static_cast<std::ptrdiff_t>(index));
+                            --index;
+                            continue;
+                        }
+                        centers.push_back(candidate);
+                        supportIndex.insert(candidate, centers.size() - 1);
+                        insertedInPass = true;
+                        insertedAny = true;
+                        batch.erase(batch.begin() +
+                                    static_cast<std::ptrdiff_t>(index));
+                        inserted = true;
+                        break;
                     }
-                    centers.push_back(candidate);
-                    supportIndex.insert(candidate, centers.size() - 1);
-                    insertedInPass = true;
-                    batch.clear();
-                    return true;
+                    if (!inserted) break;
                 }
                 batch.clear();
-                return false;
+                return insertedAny;
             };
             for (double x = radius + offset;
                  x <= region.bounds.widthMm - radius &&
@@ -366,13 +381,180 @@ PackingResult settleWithoutFriction(const PackingRegion& region, double radius,
         }
     }
 
+    // A random drop sequence can permanently block the low positions needed
+    // by a later sphere.  Build a second candidate packing from an empty
+    // support index using the close-packed horizontal rows that are natural
+    // under gravity.  Every center is still lowered against the actual
+    // centers already accepted in this candidate and then checked against
+    // the exact packing region; this is a deterministic recovery strategy,
+    // not a substitution with the FCC/HCP reference result.
+    if (!shouldStop()) {
+        std::vector<Vec3> structuredCenters;
+        SupportIndex structuredSupport(2.0 * radius);
+        const double columnSpacing = 2.0 * radius;
+        const double rowSpacing = std::sqrt(3.0) * radius;
+        const std::size_t candidateLimit =
+            std::max<std::size_t>(options.systematicSweepMaximumCandidates,
+                                  1);
+        std::size_t tested = 0;
+        for (std::size_t pass = 0;
+             pass < options.systematicSweepPasses && !shouldStop(); ++pass) {
+            const bool offsetLayer = (pass & 1U) != 0U;
+            const double phaseX = offsetLayer ? radius : 0.0;
+            const double phaseY = offsetLayer ? rowSpacing / 3.0 : 0.0;
+            bool insertedInPass = false;
+            std::size_t row = 0;
+            for (double y = radius + phaseY;
+                 y <= region.bounds.depthMm - radius &&
+                 tested < candidateLimit && !shouldStop();
+                 y += rowSpacing, ++row) {
+                const double rowOffset = (row & 1U) != 0U ? radius : 0.0;
+                for (double x = radius + phaseX + rowOffset;
+                     x <= region.bounds.widthMm - radius &&
+                     tested < candidateLimit && !shouldStop();
+                     x += columnSpacing) {
+                    ++tested;
+                    const Vec3 coarseCandidate = restingPosition(
+                        x, y, region, structuredCenters, structuredSupport,
+                        radius, false, deadline);
+                    if (!std::isfinite(coarseCandidate.z)) continue;
+                    const Vec3 candidate = restingPosition(
+                        x, y, region, structuredCenters, structuredSupport,
+                        radius, true, deadline);
+                    if (!std::isfinite(candidate.z) ||
+                        !region.containsSphere(candidate, radius, 1.0e-5)) {
+                        continue;
+                    }
+                    structuredCenters.push_back(candidate);
+                    structuredSupport.insert(candidate,
+                                             structuredCenters.size() - 1);
+                    insertedInPass = true;
+                }
+            }
+            if (!insertedInPass) break;
+        }
+        if (structuredCenters.size() > centers.size()) {
+            centers = std::move(structuredCenters);
+        }
+    }
+
+    // Repair local voids left by the random phase.  A sphere that rests on
+    // two nearby spheres has one of two horizontal circle-intersection
+    // positions; testing those positions finds the triangular holes that a
+    // rectangular sweep cannot see.  Rebuild the pair candidates after each
+    // round because every accepted sphere creates new support pairs.
+    if (!shouldStop() && centers.size() >= 2) {
+        const double diameter = 2.0 * radius;
+        const double diameterSquared = diameter * diameter;
+        const std::size_t pairCandidateLimit = std::max<std::size_t>(
+            options.systematicSweepMaximumCandidates * 4, 256);
+        for (std::size_t round = 0; round < options.systematicSweepPasses &&
+                                    !shouldStop();
+             ++round) {
+            std::vector<Vec3> pairCandidates;
+            pairCandidates.reserve(std::min<std::size_t>(
+                pairCandidateLimit, centers.size() * 4));
+            for (std::size_t first = 0; first + 1 < centers.size() &&
+                                          pairCandidates.size() + 1 <
+                                              pairCandidateLimit;
+                 ++first) {
+                for (std::size_t second = first + 1;
+                     second < centers.size() &&
+                     pairCandidates.size() + 1 < pairCandidateLimit;
+                     ++second) {
+                    const double dx = centers[second].x - centers[first].x;
+                    const double dy = centers[second].y - centers[first].y;
+                    const double horizontalSquared = dx * dx + dy * dy;
+                    if (horizontalSquared <= 1.0e-8 ||
+                        horizontalSquared > diameterSquared + 1.0e-6) {
+                        continue;
+                    }
+                    const double horizontal = std::sqrt(horizontalSquared);
+                    const double offset = std::sqrt(std::max(
+                        0.0, diameterSquared - horizontalSquared));
+                    const double midX =
+                        0.5 * (centers[first].x + centers[second].x);
+                    const double midY =
+                        0.5 * (centers[first].y + centers[second].y);
+                    const double perpendicularX = -dy / horizontal;
+                    const double perpendicularY = dx / horizontal;
+                    pairCandidates.push_back(
+                        {midX + perpendicularX * offset,
+                         midY + perpendicularY * offset, 0.0});
+                    if (pairCandidates.size() < pairCandidateLimit) {
+                        pairCandidates.push_back(
+                            {midX - perpendicularX * offset,
+                             midY - perpendicularY * offset, 0.0});
+                    }
+                }
+            }
+            if (pairCandidates.empty()) break;
+
+            std::sort(pairCandidates.begin(), pairCandidates.end(),
+                      [](const Vec3& lhs, const Vec3& rhs) {
+                          if (lhs.y != rhs.y) return lhs.y < rhs.y;
+                          return lhs.x < rhs.x;
+                      });
+            bool insertedInRound = false;
+            for (const Vec3& pairCandidate : pairCandidates) {
+                if (shouldStop()) break;
+                const Vec3 candidate = restingPosition(
+                    pairCandidate.x, pairCandidate.y, region, centers,
+                    supportIndex, radius, true, deadline);
+                if (!std::isfinite(candidate.z) ||
+                    !region.containsSphere(candidate, radius, 1.0e-5)) {
+                    continue;
+                }
+                centers.push_back(candidate);
+                supportIndex.insert(candidate, centers.size() - 1);
+                insertedInRound = true;
+            }
+            if (!insertedInRound) break;
+        }
+    }
+
+    // Use the close-packed horizontal phases as search proposals for a
+    // fresh gravity build.  The lattice itself is never copied into the
+    // result: each proposed XY position is lowered against the newly built
+    // support index and checked by the exact packing-region predicate.  This
+    // recovers holes caused by early random blocking while preserving the
+    // quasi-static settling semantics.
+    bool usedDeterministicCompaction = false;
+    if (!shouldStop()) {
+        LatticeOptions guideOptions;
+        guideOptions.phaseDivisions = 2;
+        const PackingResult guide = packHcp(region, radius, guideOptions);
+        std::vector<Vec3> compactedCenters;
+        compactedCenters.reserve(guide.centers.size());
+        SupportIndex compactedSupport(2.0 * radius);
+        for (const Vec3& proposal : guide.centers) {
+            if (shouldStop()) break;
+            const Vec3 candidate = restingPosition(
+                proposal.x, proposal.y, region, compactedCenters,
+                compactedSupport, radius, true, deadline);
+            if (!std::isfinite(candidate.z) ||
+                !region.containsSphere(candidate, radius, 1.0e-5)) {
+                continue;
+            }
+            compactedCenters.push_back(candidate);
+            compactedSupport.insert(candidate, compactedCenters.size() - 1);
+        }
+        if (compactedCenters.size() > centers.size()) {
+            centers = std::move(compactedCenters);
+            usedDeterministicCompaction = true;
+        }
+    }
+
     std::sort(centers.begin(), centers.end(), [](const Vec3& a,
                                                  const Vec3& b) {
         if (a.z != b.z) return a.z < b.z;
         if (a.y != b.y) return a.y < b.y;
         return a.x < b.x;
     });
-    return {"frictionless quasi-static settling", radius,
+    return {usedDeterministicCompaction
+                ? "frictionless quasi-static settling (deterministic compaction)"
+                : "frictionless quasi-static settling",
+            radius,
             std::move(centers), rejected, options.seed,
             stoppedByTimeLimit, stoppedByCancellation};
 }

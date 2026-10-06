@@ -105,7 +105,7 @@ QString explainAssemblyExtractionFailure(const QString& error) {
 } // namespace
 
 MainWindow::MainWindow(bool autoCompute) {
-    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.3.1 v21 真实沉降结果版"));
+    setWindowTitle(QStringLiteral("弹仓静态容量计算器 0.3.1 v22 填充优化版"));
     setWindowIcon(QIcon(QStringLiteral(":/app-icon.ico")));
     resize(1180, 760);
 
@@ -277,15 +277,16 @@ void MainWindow::runSettling() {
         const auto& region = cadRegion_.has_value() ? *cadRegion_ : fallback;
         magazine::packing::SettlingOptions options;
         if (cadRegion_.has_value()) {
-            // Keep a bounded random phase, then let the settler perform a
-            // small deterministic XY repair sweep. Exact CAD intervals are
-            // evaluated only after coarse candidates have been ranked.
+            // Keep a bounded random phase, then let the settler perform
+            // deterministic hole repair and close-packed compaction. Exact
+            // CAD intervals are evaluated only after coarse candidates have
+            // been ranked.
             options.failedInsertionsBeforeStop = 32;
             options.candidateTrialsPerSphere = 8;
             options.relaxationDirections = 8;
             options.maximumRelaxationIterations = 12;
-            options.systematicSweepPasses = 1;
-            options.systematicSweepMaximumCandidates = 300;
+            options.systematicSweepPasses = 10;
+            options.systematicSweepMaximumCandidates = 5000;
             options.systematicSweepSpacingDiameterFactor = 0.95;
             // Exact OCCT column queries are intentionally bounded in the
             // interactive path. A difficult assembly must return a usable

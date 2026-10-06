@@ -51,8 +51,8 @@ void runAssemblySettling(const magazine::packing::PackingRegion& region,
     options.candidateTrialsPerSphere = 8;
     options.relaxationDirections = 8;
     options.maximumRelaxationIterations = 12;
-    options.systematicSweepPasses = 1;
-    options.systematicSweepMaximumCandidates = 300;
+    options.systematicSweepPasses = 10;
+    options.systematicSweepMaximumCandidates = 5000;
     options.systematicSweepSpacingDiameterFactor = 0.95;
     options.maximumRuntimeMilliseconds = 20000;
     const auto start = std::chrono::steady_clock::now();
