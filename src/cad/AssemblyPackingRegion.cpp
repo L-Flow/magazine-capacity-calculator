@@ -291,19 +291,15 @@ struct AssemblyGrid {
             const gp_Vec fromFace(constraint.point, point);
             if (fromFace.Dot(gp_Vec(constraint.normal)) >= -1.0e-4) continue;
 
-            // Once the user confirms multiple faces, they describe the walls
-            // of one target cavity. Applying their one-sided planes globally
-            // prevents a flood path from going around a finite face edge into
-            // the surrounding vehicle. A single selected face remains a local
-            // hint and keeps the finite-footprint behavior used by point mode.
-            if (enforceGlobalBoundaryPlanes) return false;
-
             // A selected CAD face is finite. Applying its plane to the entire
             // assembly incorrectly turns a local face patch into an infinite
-            // wall and can collapse a real cavity into a thin band. Only use
-            // the one-sided constraint while the point is within the face's
-            // tangential footprint. The actual solid geometry remains the
-            // authoritative collision boundary outside that footprint.
+            // wall and can collapse a real cavity into a thin band. This is
+            // also true when several faces are selected: split/stepped faces
+            // often overlap only partly, so treating each plane as infinite
+            // clips valid space. Only use the one-sided constraint while the
+            // point is within the face's tangential footprint. The local
+            // boundary window, virtual gate, and exact solid geometry keep
+            // the flood fill from escaping outside the selected cavity.
             if (constraint.bounds.IsVoid()) return false;
             double minX = 0.0;
             double minY = 0.0;
@@ -1750,6 +1746,18 @@ AssemblyPackingRegion makeAssemblyPackingRegionImpl(
     }
     grid->enforceGlobalBoundaryPlanes =
         boundaryMode && grid->boundaryConstraints.size() > 1;
+
+    // A selected set may contain stepped walls, split STEP patches, or
+    // slanted faces whose finite tangential AABBs do not share the full
+    // cavity footprint.  Intersecting every such AABB is an artificial
+    // limitation: the actual solids above are the authoritative wall
+    // geometry.  Keep the selected envelope as a local safety window and use
+    // each face only where its finite footprint is crossed.  This also makes
+    // adding another valid inner face monotonic: it cannot make an existing
+    // cavity smaller merely because the new face has a shorter projection.
+    if (boundaryMode && grid->boundaryConstraints.size() > 1) {
+        grid->enforceTangentialIntersection = false;
+    }
     // A nonempty intersection can still be just a narrow fragment of the
     // cavity. In particular, a short floor patch can clip the normal axis of
     // a selected side wall even though the opposite wall is a real solid.

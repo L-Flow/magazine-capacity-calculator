@@ -389,9 +389,17 @@ void MainWindow::finishAssemblyExtraction() {
         width_->setValue(extracted.region.bounds.widthMm);
         depth_->setValue(extracted.region.bounds.depthMm);
         height_->setValue(extracted.region.bounds.heightMm);
+        // Removing the temporary AIS highlights must not erase the logical
+        // boundary selection.  clearFaceSelection() emits the selection
+        // callback, so preserve the faces across the visual cleanup; the
+        // indices are needed for reproducibility and for a later re-run.
+        const auto confirmedBoundaryFaces = boundaryFaces_;
+        const bool confirmedHasBoundaryFaces = hasBoundaryFaces_;
         viewport_->setFaceSelectionEnabled(false);
         viewport_->setPointSelectionEnabled(false);
         viewport_->clearFaceSelection();
+        boundaryFaces_ = confirmedBoundaryFaces;
+        hasBoundaryFaces_ = confirmedHasBoundaryFaces;
         viewport_->clearSelectionMarker();
         viewport_->setCadShape(cadShape_);
         const gp_Dir gravity = pendingGravity_.value_or(gp_Dir(0.0, 0.0, -1.0));
